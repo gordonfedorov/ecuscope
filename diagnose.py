@@ -1,10 +1,6 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-diagnose.py — ECUScope — Здоровье мотора.
-Главный модуль CLI: загрузка логов OpenDiag / Parquet, расчёт метрик поездки,
-сборка сводной панели диагностики и генерация интерактивного HTML-графика Plotly.
-"""
+"""ECUScope — генератор интерактивного HTML-отчёта и диагностики логов ЭБУ."""
+
+from __future__ import annotations
 
 import argparse
 import html as html_lib
@@ -34,6 +30,8 @@ from diagnose_utils import (
     COL,
     IDLE_RPM_MAX,
     IDLE_RPM_MIN,
+    IDLE_SPD_MAX,
+    IDLE_TPS_MAX,
     WARM_ECT_C,
     col_vals,
     format_duration,
@@ -42,24 +40,24 @@ from parser import load_table, save_csv, save_parquet
 
 
 def get_valid_indices(table: pa.Table) -> list[int]:
-    """Возвращает индексы валидных кадров без заглушек 0xDD при потере связи с ЭБУ."""
+    """Возвращает индексы валидных кадров лога (отсекает мусор и обрывы связи)."""
     n = table.num_rows
     if n == 0:
         return []
 
     rpm_all = col_vals(table, COL["RPM"])
     ect_all = col_vals(table, COL["ECT"])
-    err_all = col_vals(table, COL["ERR"])
+    vbat_all = col_vals(table, COL["VBAT"])
 
-    valid = []
+    valid: list[int] = []
     for i in range(n):
         rpm = rpm_all[i] if i < len(rpm_all) else None
         ect = ect_all[i] if i < len(ect_all) else None
-        err = err_all[i] if i < len(err_all) else None
+        vbat = vbat_all[i] if i < len(vbat_all) else None
 
-        if err == 221 and (rpm is None or rpm >= 8800) and (ect is None or ect >= 220.0):
+        if rpm is None and ect is None and vbat is None:
             continue
-        if rpm is not None and rpm > 8500:
+        if rpm is not None and (rpm < 0 or rpm > 10000):
             continue
         if ect is not None and (ect < -45.0 or ect > 160.0):
             continue
@@ -81,25 +79,26 @@ def analyze_log(table: pa.Table) -> dict:
     tps_all = col_vals(table, COL["TPS"])
     fuel_all = col_vals(table, COL["FUEL"])
     idle_flag = col_vals(table, COL["IDLE"])
-    fcut_flag = col_vals(table, COL["FCUT"])
 
-    run_idx = [
-        i for i in valid_idx
-        if i < len(rpm_all) and rpm_all[i] is not None and rpm_all[i] >= 450
-    ]
+    run_idx: list[int] = []
+    hot_idle_idx: list[int] = []
 
-    hot_idle_idx = [
-        i for i in run_idx
-        if IDLE_RPM_MIN <= rpm_all[i] <= IDLE_RPM_MAX
-        and (i < len(ect_all) and ect_all[i] is not None and ect_all[i] >= WARM_ECT_C)
-        and (i >= len(fcut_flag) or fcut_flag[i] != 1)
-        and (
-            (i < len(idle_flag) and idle_flag[i] == 1)
-            or (i < len(tps_all) and tps_all[i] is not None and tps_all[i] < 1.5)
-        )
-    ]
+    for i in valid_idx:
+        rpm = rpm_all[i] if i < len(rpm_all) else None
+        ect = ect_all[i] if i < len(ect_all) else None
+        spd = spd_all[i] if i < len(spd_all) else None
+        tps = tps_all[i] if i < len(tps_all) else None
+        ifl = idle_flag[i] if i < len(idle_flag) else None
 
-    # Интегрирование длительности, пробега и расхода топлива
+        if rpm is not None and rpm >= 450:
+            run_idx.append(i)
+            is_warm = ect is not None and ect >= WARM_ECT_C
+            is_low_spd = spd is None or spd <= IDLE_SPD_MAX
+            is_closed_tps = (tps is not None and tps <= IDLE_TPS_MAX) or (ifl == 1)
+            is_idle_rpm = IDLE_RPM_MIN <= rpm <= IDLE_RPM_MAX
+            if is_warm and is_low_spd and is_closed_tps and is_idle_rpm:
+                hot_idle_idx.append(i)
+
     total_sec = 0.0
     run_sec = 0.0
     idle_sec = 0.0
@@ -109,13 +108,12 @@ def analyze_log(table: pa.Table) -> dict:
     for pos in range(len(valid_idx) - 1):
         i0 = valid_idx[pos]
         i1 = valid_idx[pos + 1]
-        if i0 >= len(times_raw) or i1 >= len(times_raw):
-            continue
-        t0, t1 = times_raw[i0], times_raw[i1]
+        t0 = times_raw[i0] if i0 < len(times_raw) else None
+        t1 = times_raw[i1] if i1 < len(times_raw) else None
         if t0 is None or t1 is None:
             continue
-        dt = t1 - t0
-        if dt <= 0.0 or dt > 10.0:
+        dt = float(t1) - float(t0)
+        if dt <= 0 or dt > 15.0:
             continue
 
         total_sec += dt
@@ -143,9 +141,9 @@ def analyze_log(table: pa.Table) -> dict:
         ("Простой / ХХ", format_duration(idle_sec)),
     ]
 
-    checks = []
-    checks.extend(run_base_checks(table, valid_idx, run_idx, hot_idle_idx))
-    checks.extend(run_extra_checks(table, valid_idx, run_idx, hot_idle_idx))
+    base_checks = run_base_checks(table, valid_idx, run_idx, hot_idle_idx)
+    extra_checks = run_extra_checks(table, valid_idx, run_idx, hot_idle_idx, base_results=base_checks)
+    checks = list(base_checks) + list(extra_checks)
 
     return {
         "valid_count": len(valid_idx),
@@ -167,9 +165,13 @@ def render_summary_html(report: dict) -> str:
 
     stat_badges = []
     if bad_cnt:
-        stat_badges.append(f'<span class="meta-badge" style="border-color:#ff4d4d;color:#ff8080">Ошибок: <b>{bad_cnt}</b></span>')
+        stat_badges.append(
+            f'<span class="meta-badge" style="border-color:#ff4d4d;color:#ff8080">Ошибок: <b>{bad_cnt}</b></span>'
+        )
     if warn_cnt:
-        stat_badges.append(f'<span class="meta-badge" style="border-color:#ffab00;color:#ffd54f">Внимание: <b>{warn_cnt}</b></span>')
+        stat_badges.append(
+            f'<span class="meta-badge" style="border-color:#ffab00;color:#ffd54f">Внимание: <b>{warn_cnt}</b></span>'
+        )
 
     cards_html = []
     for c in checks:
@@ -209,11 +211,36 @@ def _classify_column(col_name: str) -> str:
         return "Холостой ход (ХХ)"
     if "опережения" in low or "детонац" in low or "пропуск" in low or "неравномерност" in low or "демпфер" in low:
         return "Зажигание, детонация и пропуски"
-    if "впрыск" in low or "кислород" in low or "лямбда" in low or "коррекц" in low or "адсорбер" in low or "топлив" in low or "форс" in low or "катализатор" in low:
+    if (
+        "впрыск" in low
+        or "кислород" in low
+        or "лямбда" in low
+        or "коррекц" in low
+        or "адсорбер" in low
+        or "топлив" in low
+        or "форс" in low
+        or "катализатор" in low
+    ):
         return "Топливо и датчики кислорода"
-    if "температур" in low or "напряж" in low or "ошибок" in low or "сброс" in low or "сумма" in low or "сопротивлен" in low or "ускорен" in low or "рециркуляц" in low:
+    if (
+        "температур" in low
+        or "напряж" in low
+        or "ошибок" in low
+        or "сброс" in low
+        or "сумма" in low
+        or "сопротивлен" in low
+        or "ускорен" in low
+        or "рециркуляц" in low
+    ):
         return "Температуры, питание и ЭБУ"
     return "Двигатель, воздух и нагрузка"
+
+
+def _fmt_scale(val: float) -> str:
+    """Форматирует коэффициент масштаба для поля ввода."""
+    if val == int(val):
+        return str(int(val))
+    return f"{val:g}"
 
 
 def build_interactive_html(
@@ -244,6 +271,7 @@ def build_interactive_html(
     fig = go.Figure()
     raw_traces_y: list[list[float | None]] = []
     base_names: list[str] = []
+    default_indices: list[int] = []
 
     trace_idx = 0
     for col_name in table.column_names:
@@ -251,64 +279,93 @@ def build_interactive_html(
             continue
 
         col_list = table[col_name].to_pylist()
-        raw_y: list[float | None] = []
+        y_raw: list[float | None] = []
         has_numeric = False
 
         for i in valid_idx:
-            val = col_list[i] if i < len(col_list) else None
-            if val is None:
-                raw_y.append(None)
-            elif isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val):
-                raw_y.append(round(float(val), 5))
-                has_numeric = True
+            v = col_list[i] if i < len(col_list) else None
+            if v is None:
+                y_raw.append(None)
             else:
-                raw_y.append(None)
+                try:
+                    fv = float(v)
+                    if math.isnan(fv) or math.isinf(fv):
+                        y_raw.append(None)
+                    else:
+                        y_raw.append(round(fv, 5))
+                        has_numeric = True
+                except (TypeError, ValueError):
+                    y_raw.append(None)
 
         if not has_numeric:
             continue
 
         color = BASE_COLORS[trace_idx % len(BASE_COLORS)]
-        def_scale = float(DEFAULT_SCALES.get(col_name, 1.0))
+        scale = float(DEFAULT_SCALES.get(col_name, 1.0))
         is_vis = col_name in default_set
 
-        scaled_y = (
-            raw_y
-            if def_scale == 1.0
-            else [None if v is None else round(v * def_scale, 5) for v in raw_y]
-        )
-        trace_name = col_name if def_scale == 1.0 else f"{col_name} [x{def_scale:g}]"
+        if is_vis:
+            default_indices.append(trace_idx)
+
+        y_scaled = [
+            None if v is None else (v if scale == 1.0 else round(v * scale, 5))
+            for v in y_raw
+        ]
+        trace_name = col_name if scale == 1.0 else f"{col_name} [x{_fmt_scale(scale)}]"
 
         fig.add_trace(
             go.Scattergl(
                 x=x_vals,
-                y=scaled_y,
-                customdata=raw_y,
-                name=trace_name,
+                y=y_scaled,
+                customdata=y_raw,
                 mode="lines",
+                name=trace_name,
                 line=dict(color=color, width=1.6),
                 visible=True if is_vis else False,
                 hovertemplate="%{fullData.name}: <b>%{customdata}</b><extra></extra>",
             )
         )
 
-        cat = _classify_column(col_name)
-        grouped.setdefault(cat, []).append((trace_idx, col_name, color, def_scale, is_vis))
-        raw_traces_y.append(raw_y)
+        raw_traces_y.append(y_raw)
         base_names.append(col_name)
+
+        cat = _classify_column(col_name)
+        if cat not in grouped:
+            grouped[cat] = []
+        grouped[cat].append((trace_idx, col_name, color, scale, is_vis))
         trace_idx += 1
 
-    groups_html_parts = []
-    for cat in CATEGORY_ORDER:
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#000000",
+        plot_bgcolor="#080b10",
+        margin=dict(l=52, r=20, t=28, b=38),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+        xaxis=dict(title="Время лога (с)", gridcolor="#1c2128", zeroline=False),
+        yaxis=dict(title="Значение (с учётом масштаба)", gridcolor="#1c2128", zeroline=False),
+    )
+
+    plot_div = fig.to_html(
+        full_html=False,
+        include_plotlyjs=True,
+        div_id="chart",
+        config={"responsive": True, "displaylogo": False},
+    )
+
+    groups_blocks: list[str] = []
+    ordered_cats = list(CATEGORY_ORDER) + [c for c in grouped if c not in CATEGORY_ORDER]
+    for cat in ordered_cats:
         items = grouped.get(cat, [])
         if not items:
             continue
-        rows = []
-        for idx, name, color, def_scale, is_vis in items:
+        rows_html: list[str] = []
+        for idx, cname, color, scale, is_vis in items:
             checked_attr = " checked" if is_vis else ""
-            esc_name = html_lib.escape(name)
-            esc_lower = html_lib.escape(name.lower())
-            rows.append(
-                f'<div class="param-row" data-name="{esc_lower}">'
+            esc_name = html_lib.escape(cname)
+            sc_str = _fmt_scale(scale)
+            rows_html.append(
+                f'<div class="param-row" data-name="{esc_name.lower()}">'
                 f'<label class="param-item">'
                 f'<input type="checkbox" data-idx="{idx}"{checked_attr}>'
                 f'<span class="color-dot" style="background:{color}"></span>'
@@ -316,97 +373,64 @@ def build_interactive_html(
                 f"</label>"
                 f'<div class="scale-box">'
                 f'<span class="scale-prefix">x</span>'
-                f'<input type="text" class="scale-input" data-idx="{idx}" '
-                f'data-default-scale="{def_scale:g}" value="{def_scale:g}">'
+                f'<input type="text" class="scale-input" data-idx="{idx}" value="{sc_str}" title="Множитель масштаба">'
                 f"</div>"
                 f"</div>"
             )
-        open_attr = " open" if any(it[4] for it in items) else ""
-        groups_html_parts.append(
-            f'<details class="cat-group"{open_attr}>'
-            f'<summary class="cat-title">{html_lib.escape(cat)} '
-            f'<span class="cat-count">({len(items)})</span></summary>'
-            f'<div class="cat-body">{"".join(rows)}</div>'
-            f"</details>"
+        groups_blocks.append(
+            f'<div class="cat-group">'
+            f'<div class="cat-title">{html_lib.escape(cat)} <span class="cat-count">({len(items)})</span></div>'
+            f'<div class="cat-body">{"".join(rows_html)}</div>'
+            f"</div>"
         )
 
-    chart_title = title or f"ECUScope — Здоровье мотора ({Path(html_path).stem})"
-    fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="#000000",
-        plot_bgcolor="#05070a",
-        title=dict(text=chart_title, font=dict(size=14, color="#e6edf3"), x=0.01),
-        margin=dict(l=55, r=20, t=42, b=42),
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1.0, font=dict(size=11)),
-        xaxis=dict(
-            title="Время (с)",
-            gridcolor="#161b22",
-            zerolinecolor="#30363d",
-            range=[min_time, max_time],
-        ),
-        yaxis=dict(
-            title="Масштабированное значение",
-            gridcolor="#161b22",
-            zerolinecolor="#30363d",
-        ),
+    page_title = title or f"ECUScope — {Path(html_path).stem}"
+    final_html = (
+        HTML_TEMPLATE.replace("__TITLE__", html_lib.escape(page_title))
+        .replace("__SUMMARY_HTML__", summary_html)
+        .replace("__GROUPS_HTML__", "\n".join(groups_blocks))
+        .replace("__PLOT_DIV__", plot_div)
+        .replace("__DEFAULT_JSON__", json.dumps(default_indices))
+        .replace("__RAW_TRACES_JSON__", json.dumps(raw_traces_y))
+        .replace("__BASE_NAMES_JSON__", json.dumps(base_names, ensure_ascii=False))
+        .replace("__MIN_TIME__", str(min_time))
+        .replace("__MAX_TIME__", str(max_time))
     )
 
-    plot_div = fig.to_html(
-        full_html=False,
-        include_plotlyjs="cdn",
-        div_id="chart",
-        config={"responsive": True, "displaylogo": False},
-    )
-
-    out_html = HTML_TEMPLATE
-    out_html = out_html.replace("__GROUPS_HTML__", "\n".join(groups_html_parts))
-    out_html = out_html.replace("__SUMMARY_HTML__", summary_html)
-    out_html = out_html.replace("__PLOT_DIV__", plot_div)
-    out_html = out_html.replace("__DEFAULT_JSON__", json.dumps(default_visible, ensure_ascii=False))
-    out_html = out_html.replace("__RAW_TRACES_JSON__", json.dumps(raw_traces_y))
-    out_html = out_html.replace("__BASE_NAMES_JSON__", json.dumps(base_names, ensure_ascii=False))
-    out_html = out_html.replace("__MIN_TIME__", str(min_time))
-    out_html = out_html.replace("__MAX_TIME__", str(max_time))
-
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(out_html)
+    Path(html_path).write_text(final_html, encoding="utf-8")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="ECUScope — Здоровье мотора: анализ диагностических логов ЭБУ Bosch M7.9.7 / M7.9.7+."
+        description="ECUScope — диагностика логов OpenDiag (Bosch M7.9.7 / Torque PIDs) и интерактивный график."
     )
     parser.add_argument("input", help="Путь к логу OpenDiag (.log/.txt) или таблице (.parquet)")
     parser.add_argument("--html", help="Путь для сохранения HTML-отчёта (по умолчанию рядом с исходным файлом)")
     parser.add_argument("--parquet", help="Путь для сохранения Parquet (при чтении сырого лога)")
     parser.add_argument("--csv", help="Дополнительно экспортировать таблицу в CSV")
+    parser.add_argument(
+        "--pid-file",
+        default="pids/bosch_m797.csv",
+        help="Путь к CSV-файлу формул в формате Torque Pro (по умолчанию pids/bosch_m797.csv)",
+    )
     parser.add_argument("--title", help="Заголовок графика в отчёте")
     parser.add_argument("--no-browser", action="store_true", help="Не открывать HTML-отчёт в браузере автоматически")
     args = parser.parse_args()
 
-    input_path = Path(args.input)
-    if not input_path.exists():
-        print(f"Ошибка: файл не найден: {input_path}", file=sys.stderr)
+    in_path = Path(args.input)
+    if not in_path.exists():
+        print(f"Ошибка: файл не найден: {in_path}", file=sys.stderr)
         sys.exit(1)
 
-    try:
-        table, is_raw = load_table(input_path)
-    except Exception as exc:
-        print(f"Ошибка загрузки файла {input_path}: {exc}", file=sys.stderr)
+    pid_path = Path(args.pid_file)
+    if in_path.suffix.lower() != ".parquet" and not pid_path.exists():
+        print(f"Ошибка: файл формул Torque не найден: {pid_path}", file=sys.stderr)
         sys.exit(1)
 
-    if table.num_rows == 0:
-        print(f"Пропуск: в файле {input_path} отсутствуют кадры диагностики (только инициализация или нет ответа ЭБУ).")
-        sys.exit(0)
+    table, was_raw = load_table(in_path, pid_file=pid_path)
 
-    valid_idx = get_valid_indices(table)
-    if not valid_idx:
-        print(f"Пропуск: в файле {input_path} отсутствуют рабочие кадры (только заглушки или нет связи с ЭБУ).")
-        sys.exit(0)
-
-    if is_raw:
-        pq_path = Path(args.parquet) if args.parquet else input_path.with_suffix(".parquet")
+    if was_raw:
+        pq_path = Path(args.parquet) if args.parquet else in_path.with_suffix(".parquet")
         save_parquet(table, pq_path)
         print(f"Сохранено в Parquet: {pq_path}")
 
@@ -415,14 +439,13 @@ def main() -> None:
         save_csv(table, csv_path)
         print(f"Сохранено в CSV: {csv_path}")
 
-    html_path = Path(args.html) if args.html else input_path.with_suffix(".html")
+    html_path = Path(args.html) if args.html else in_path.with_suffix(".html")
     try:
         build_interactive_html(table, html_path, DEFAULT_VISIBLE, args.title)
     except ValueError as exc:
-        print(f"Пропуск {input_path}: {exc}")
-        sys.exit(0)
-
-    print(f"Отчёт сохранён: {html_path}")
+        print(f"Пропуск ({args.input}): {exc}")
+        return
+    print(f"HTML-отчёт готов: {html_path}")
 
     if not args.no_browser:
         webbrowser.open(html_path.resolve().as_uri())

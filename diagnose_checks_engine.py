@@ -1,276 +1,420 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-diagnose_checks_engine.py — проверки механики и зажигания ЭБУ (Bosch M7.9.7):
-  - Детонация и величина отскока УОЗ под нагрузкой;
-  - Детализация пропусков воспламенения по цилиндрам 1-4 и пиковый расход воздуха ДМРВ;
-  - Стабильность сигнала ДПКВ (мгновенные срывы оборотов в 0 на ходу) и динамика УОЗ.
-"""
+"""Модуль проверок зажигания, детонации, пропусков, ДПКВ и динамики отклика ДВС."""
+
+from __future__ import annotations
 
 import statistics
 import pyarrow as pa
-from diagnose_utils import COL, col_vals, sub
+
+from diagnose_utils import COL, col_vals, fmt_sec, sub
 
 
-def check_knock_and_retard(table: pa.Table, valid_idx: list[int], run_idx: list[int]) -> dict | None:
-    """Анализ детонации и величины отскока УОЗ под нагрузкой."""
+def _make_card(
+    title: str,
+    val: str,
+    norm: str,
+    status: str = "status-ok",
+    badge: str | None = None,
+    tooltip: str = "",
+) -> dict:
+    if badge is None:
+        badge_map = {
+            "status-ok": "НОРМА",
+            "status-warn": "ВНИМАНИЕ",
+            "status-bad": "ПРОБЛЕМА",
+            "status-na": "НЕТ ДАННЫХ",
+        }
+        badge = badge_map.get(status, "ИНФО")
+    return {
+        "title": title,
+        "badge": badge,
+        "val": val,
+        "norm": norm,
+        "status": status,
+        "tooltip": tooltip,
+    }
+
+
+def check_knock_and_retard(
+    table: pa.Table,
+    valid_idx: list[int],
+    run_idx: list[int] | None = None,
+    hot_idle_idx: list[int] | None = None,
+) -> dict:
+    """Проверка детонации и глубины отскока УОЗ под нагрузкой."""
+    idx_pool = run_idx if run_idx else valid_idx
     retard_all = col_vals(table, COL["KNOCK_RETARD"])
     knock_v_all = col_vals(table, COL["KNOCK_V"])
-    if not retard_all and not knock_v_all:
-        return None
-
-    times_raw = col_vals(table, COL["TIME"])
     rpm_all = col_vals(table, COL["RPM"])
-    load_all = col_vals(table, COL["LOAD"]) or col_vals(table, COL["CALC_LOAD"])
+    load_all = col_vals(table, COL["LOAD"])
     iat_all = col_vals(table, COL["IAT"])
+    time_all = col_vals(table, COL["TIME"])
 
-    target_idx = run_idx if run_idx else valid_idx
-    if not target_idx:
-        return None
-
-    retards = sub(retard_all, target_idx)
-    knock_vs = sub(knock_v_all, target_idx)
-    if not retards and not knock_vs:
-        return None
-
-    max_ret = max(retards) if retards else 0.0
-    active_ret_idx = [
-        i for i in target_idx
-        if i < len(retard_all) and retard_all[i] is not None and retard_all[i] > 0.1
-    ]
-    heavy_ret_idx = [
-        i for i in target_idx
-        if i < len(retard_all) and retard_all[i] is not None and retard_all[i] >= 4.5
-    ]
-
-    max_kv = max(knock_vs) if knock_vs else None
-    med_kv = statistics.median(knock_vs) if knock_vs else None
-
-    if max_ret >= 7.5 or len(heavy_ret_idx) >= 15:
-        st, badge = "status-bad", "СИЛЬНЫЙ ОТСКОК"
-    elif max_ret >= 3.8 or len(active_ret_idx) > max(10, int(len(target_idx) * 0.08)):
-        st, badge = "status-warn", "ДЕТОНАЦИЯ"
-    else:
-        st, badge = "status-ok", "НОРМА"
-
-    kv_txt = f" | ДД: мед. {med_kv:.2f} В (пик {max_kv:.2f} В)" if (med_kv is not None and max_kv is not None) else ""
-    pct_ret = (len(active_ret_idx) / len(target_idx)) * 100.0 if target_idx else 0.0
-    val_txt = f"Макс. отскок: {max_ret:.1f}° (кадров: {len(active_ret_idx)}, {pct_ret:.1f}%){kv_txt}"
-
-    tooltip_lines = [
-        f"Кадров с отскоком УОЗ > 0°: {len(active_ret_idx)} из {len(target_idx)}",
-        f"Кадров с глубоким отскоком ≥ 4.5°: {len(heavy_ret_idx)}",
-    ]
-    if active_ret_idx:
-        top_idx = sorted(active_ret_idx, key=lambda idx: retard_all[idx], reverse=True)[:5]
-        tooltip_lines.append("Топ эпизодов отскока УОЗ:")
-        for idx in top_idx:
-            t_s = f"{times_raw[idx]:.1f} с" if idx < len(times_raw) and times_raw[idx] is not None else "?"
-            rpm_s = f"{rpm_all[idx]} об/мин" if idx < len(rpm_all) and rpm_all[idx] is not None else "?"
-            ld_s = f"нагр. {load_all[idx]:.0f}%" if idx < len(load_all) and load_all[idx] is not None else ""
-            iat_s = f"ДТВ {iat_all[idx]:.0f}°C" if idx < len(iat_all) and iat_all[idx] is not None else ""
-            extra = ", ".join(p for p in (rpm_s, ld_s, iat_s) if p)
-            tooltip_lines.append(f"  • {t_s}: -{retard_all[idx]:.1f}° ({extra})")
-
-    return {
-        "title": "Детонация и отскок УОЗ",
-        "badge": badge,
-        "status": st,
-        "val": val_txt,
-        "norm": "Норма: единичные отскоки до 3.0–3.5° при резком разгоне",
-        "tooltip": "\n".join(tooltip_lines),
-    }
-
-
-def check_misfires_and_peak_maf(table: pa.Table, valid_idx: list[int], run_idx: list[int]) -> dict | None:
-    """Детализация пропусков воспламенения по цилиндрам 1-4 и пиковый расход воздуха ДМРВ."""
-    cyl_cols = [
-        ("Цил. 1", COL["MIS_CYL_1"]),
-        ("Цил. 2", COL["MIS_CYL_2"]),
-        ("Цил. 3", COL["MIS_CYL_3"]),
-        ("Цил. 4", COL["MIS_CYL_4"]),
-    ]
-
-    maf_all = col_vals(table, COL["MAF"])
-    cycle_air_all = col_vals(table, COL["CYCLE_AIR"])
-    rpm_all = col_vals(table, COL["RPM"])
-    tps_all = col_vals(table, COL["TPS"])
-    times_raw = col_vals(table, COL["TIME"])
-
-    cyl_max: dict[str, int] = {}
-    for label, col_name in cyl_cols:
-        vals = sub(col_vals(table, col_name), valid_idx)
-        if vals:
-            cyl_max[label] = int(max(vals))
-
-    sum_vals = sub(col_vals(table, COL["MIS_SUM"]), valid_idx)
-    total_mis = max(sum_vals) if sum_vals else sum(cyl_max.values())
-
-    target_idx = run_idx if run_idx else valid_idx
-    mafs = sub(maf_all, target_idx)
-    c_airs = sub(cycle_air_all, target_idx)
-
-    if not cyl_max and not mafs:
-        return None
-
-    peak_maf = max(mafs) if mafs else None
-    peak_c_air = max(c_airs) if c_airs else None
-
-    peak_maf_info = ""
-    if mafs:
-        best_i = max(
-            (i for i in target_idx if i < len(maf_all) and maf_all[i] is not None),
-            key=lambda idx: maf_all[idx],
+    ret_sub = sub(retard_all, idx_pool)
+    if not ret_sub:
+        return _make_card(
+            title="Детонация и отскок УОЗ",
+            val="Нет данных",
+            norm="Отскок УОЗ под нагрузкой ≤ 4.0 °ПКВ",
+            status="status-na",
+            tooltip="В логе отсутствует канал отскока УОЗ по детонации.",
         )
-        p_rpm = rpm_all[best_i] if best_i < len(rpm_all) and rpm_all[best_i] is not None else None
-        p_tps = tps_all[best_i] if best_i < len(tps_all) and tps_all[best_i] is not None else None
-        p_t = times_raw[best_i] if best_i < len(times_raw) and times_raw[best_i] is not None else None
-        parts = []
-        if p_rpm is not None:
-            parts.append(f"{p_rpm} об/мин")
-        if p_tps is not None:
-            parts.append(f"ДПДЗ {p_tps:.0f}%")
-        if p_t is not None:
-            parts.append(f"на {p_t:.1f} с")
-        if parts:
-            peak_maf_info = f" ({', '.join(parts)})"
 
-    wot_idx = [
-        i for i in target_idx
-        if i < len(tps_all) and tps_all[i] is not None and tps_all[i] >= 65.0
-        and i < len(rpm_all) and rpm_all[i] is not None and rpm_all[i] >= 4000
-        and i < len(maf_all) and maf_all[i] is not None
-    ]
-    wot_peak_maf = max(maf_all[i] for i in wot_idx) if wot_idx else None
+    episodes = []
+    for i in idx_pool:
+        r = retard_all[i] if i < len(retard_all) else None
+        if r is not None and r > 0.5:
+            rpm = rpm_all[i] if i < len(rpm_all) else 0
+            load = load_all[i] if i < len(load_all) else 0
+            iat = iat_all[i] if i < len(iat_all) else None
+            t = time_all[i] if i < len(time_all) else 0.0
+            episodes.append((r, t, rpm, load, iat))
 
-    bad_cyls = [f"{lbl}={cnt}" for lbl, cnt in cyl_max.items() if cnt > 0]
+    max_ret = max(ret_sub)
+    deep_cnt = sum(1 for r, *_ in episodes if r >= 4.5)
+    kv_sub = sub(knock_v_all, idx_pool)
+    max_kv = max(kv_sub) if kv_sub else None
 
-    if total_mis > 5 or any(cnt > 3 for cnt in cyl_max.values()):
-        st, badge = "status-bad", "ПРОПУСКИ"
-    elif total_mis > 0 or bad_cyls:
-        st, badge = "status-warn", "ЕДИНИЧНЫЕ"
-    elif wot_peak_maf is not None and wot_peak_maf < 155.0:
-        st, badge = "status-warn", "СЛАБЫЙ ПИК ДМРВ"
+    if max_ret >= 7.5 or deep_cnt >= 15:
+        status = "status-bad"
+        badge = "ДЕТОНАЦИЯ"
+    elif max_ret >= 4.5 or deep_cnt >= 5:
+        status = "status-warn"
+        badge = "ОТБИВКА УОЗ"
     else:
-        st, badge = "status-ok", "НОРМА"
+        status = "status-ok"
+        badge = "НОРМА"
 
-    cyl_str = f"Пропуски: {', '.join(bad_cyls)}" if bad_cyls else f"Пропуски по цил.: 0 (сумма {total_mis})"
-    maf_str = ""
-    if peak_maf is not None:
-        ca_txt = f", {peak_c_air:.0f} мг/такт" if peak_c_air is not None else ""
-        maf_str = f" | Пик ДМРВ: {peak_maf:.1f} кг/ч{ca_txt}"
+    val = f"Макс. отскок {max_ret:.1f}°"
+    if episodes:
+        val += f" ({len(episodes)} кадр.)"
+    norm = "Норма ≤ 4.0°" + (f" | Пик ДД: {max_kv:.2f} В" if max_kv is not None else "")
 
-    tooltip_lines = ["Счётчики пропусков по цилиндрам:"]
-    if cyl_max:
-        tooltip_lines.append("  " + ", ".join(f"{k}: {v}" for k, v in cyl_max.items()))
-    tooltip_lines.append(f"  Суммарный счётчик ЭБУ: {total_mis}")
-    if peak_maf is not None:
-        tooltip_lines.append(f"Максимальный расход воздуха: {peak_maf:.1f} кг/ч{peak_maf_info}")
-    if peak_c_air is not None:
-        tooltip_lines.append(f"Максимальное цикловое наполнение: {peak_c_air:.1f} мг/такт (норма 1.5/1.6л: 330–430 мг/такт)")
-    if wot_peak_maf is not None:
-        tooltip_lines.append(f"Пик ДМРВ при полном газе (≥4000 об/мин, ДПДЗ ≥65%): {wot_peak_maf:.1f} кг/ч")
+    tip_lines = [
+        f"Кадров с отскоком УОЗ (>0.5°): {len(episodes)}, глубоких (≥4.5°): {deep_cnt}.",
+    ]
+    if episodes:
+        top = sorted(episodes, key=lambda x: x[0], reverse=True)[:4]
+        for r, t, rpm, load, iat in top:
+            iat_s = f", ДТВ {iat:.0f}°C" if iat is not None else ""
+            tip_lines.append(
+                f"• {fmt_sec(t)}: отскок {r:.1f}° при {rpm:.0f} об/мин, нагрузка {load:.0f}%{iat_s}"
+            )
+    else:
+        tip_lines.append("Детонационной коррекции УОЗ не зафиксировано.")
 
-    return {
-        "title": "Цилиндры и пик ДМРВ",
-        "badge": badge,
-        "status": st,
-        "val": f"{cyl_str}{maf_str}",
-        "norm": "Норма: 0 пропусков; пик ДМРВ 1.5/1.6л: 200–280 кг/ч",
-        "tooltip": "\n".join(tooltip_lines),
-    }
+    return _make_card(
+        title="Детонация и отскок УОЗ",
+        val=val,
+        norm=norm,
+        status=status,
+        badge=badge,
+        tooltip="\n".join(tip_lines),
+    )
 
 
-def check_ckp_and_ign_dynamics(table: pa.Table, valid_idx: list[int], run_idx: list[int]) -> dict | None:
-    """
-    Проверка стабильности сигнала ДПКВ (мгновенные срывы оборотов в 0 при движении/работе)
-    и динамического диапазона регулирования УОЗ под нагрузкой и оборотами.
-    """
+def check_misfire_and_peak_maf(
+    table: pa.Table,
+    valid_idx: list[int],
+    run_idx: list[int] | None = None,
+    hot_idle_idx: list[int] | None = None,
+) -> dict:
+    """Детализация пропусков воспламенения по цилиндрам 1-4 и пиковый расход ДМРВ."""
+    idx_pool = run_idx if run_idx else valid_idx
+    cyl_keys = ["MIS_CYL_1", "MIS_CYL_2", "MIS_CYL_3", "MIS_CYL_4"]
+    cyl_max = []
+    for idx_c, key in enumerate(cyl_keys, start=1):
+        vals = sub(col_vals(table, COL[key]), idx_pool)
+        cyl_max.append((idx_c, int(max(vals)) if vals else 0))
+
+    mis_sum_vals = sub(col_vals(table, COL["MIS_SUM"]), idx_pool)
+    sum_max = int(max(mis_sum_vals)) if mis_sum_vals else sum(v for _, v in cyl_max)
+
+    maf_vals = sub(col_vals(table, COL["MAF"]), idx_pool)
+    rpm_vals = sub(col_vals(table, COL["RPM"]), idx_pool)
+    peak_maf = max(maf_vals) if maf_vals else None
+    peak_rpm = max(rpm_vals) if rpm_vals else None
+
+    worst_cyl, worst_cnt = max(cyl_max, key=lambda x: x[1])
+    total_cyl = sum(v for _, v in cyl_max)
+
+    if worst_cnt >= 15 or total_cyl >= 25 or sum_max >= 25:
+        status = "status-bad"
+        badge = f"ПРОПУСКИ Ц{worst_cyl}"
+    elif worst_cnt >= 3 or total_cyl >= 5 or sum_max >= 5:
+        status = "status-warn"
+        badge = "ЕСТЬ ПРОПУСКИ"
+    else:
+        status = "status-ok"
+        badge = "НОРМА"
+
+    if total_cyl > 0:
+        cyl_str = "/".join(str(v) for _, v in cyl_max)
+        val = f"Ц1-4: {cyl_str}"
+    else:
+        val = "Пропусков: 0"
+        if peak_maf is not None:
+            val += f" | Пик {peak_maf:.0f} кг/ч"
+
+    norm = (
+        f"Пик ДМРВ: {peak_maf:.1f} кг/ч (до {peak_rpm:.0f} об/мин)"
+        if (peak_maf is not None and peak_rpm is not None)
+        else "Норма: 0 пропусков по цилиндрам"
+    )
+
+    tip_lines = [
+        "Макс. счётчики пропусков по цилиндрам: "
+        + ", ".join(f"Ц{c}={v}" for c, v in cyl_max)
+        + f" (общий счётчик: {sum_max}).",
+    ]
+    if peak_maf is not None and peak_rpm is not None:
+        tip_lines.append(
+            f"Пиковый расход воздуха ДМРВ: {peak_maf:.1f} кг/ч при макс. оборотах {peak_rpm:.0f} об/мин."
+        )
+
+    return _make_card(
+        title="Пропуски и пик ДМРВ",
+        val=val,
+        norm=norm,
+        status=status,
+        badge=badge,
+        tooltip="\n".join(tip_lines),
+    )
+
+
+check_misfires_by_cylinder = check_misfire_and_peak_maf
+
+
+def check_ckp_and_ign_dynamics(
+    table: pa.Table,
+    valid_idx: list[int],
+    run_idx: list[int] | None = None,
+    hot_idle_idx: list[int] | None = None,
+) -> dict:
+    """Проверка стабильности сигнала ДПКВ (отсутствие срывов в 0) и динамики УОЗ."""
     rpm_all = col_vals(table, COL["RPM"])
     ign_all = col_vals(table, COL["IGN"])
     spd_all = col_vals(table, COL["SPD"])
-    times_raw = col_vals(table, COL["TIME"])
-    crank_std_all = col_vals(table, COL["CRANK_STD"])
+    time_all = col_vals(table, COL["TIME"])
+    unbal_all = col_vals(table, COL["CRANK_UNBAL"])
 
-    if not rpm_all and not ign_all:
-        return None
-
-    # 1. Детектор кратковременных провалов оборотов до 0 на ходу (признак сбоя ДПКВ / проводки)
-    ckp_glitches = []
+    dropouts = []
     for pos in range(1, len(valid_idx) - 1):
         i_prev = valid_idx[pos - 1]
-        i_cur = valid_idx[pos]
+        i_curr = valid_idx[pos]
         i_next = valid_idx[pos + 1]
-        if i_cur >= len(rpm_all) or i_prev >= len(rpm_all) or i_next >= len(rpm_all):
-            continue
-        r_prev = rpm_all[i_prev]
-        r_cur = rpm_all[i_cur]
-        r_next = rpm_all[i_next]
-        spd_cur = spd_all[i_cur] if i_cur < len(spd_all) and spd_all[i_cur] is not None else 0.0
-        t_cur = times_raw[i_cur] if i_cur < len(times_raw) else None
-        t_prev = times_raw[i_prev] if i_prev < len(times_raw) else None
-        t_next = times_raw[i_next] if i_next < len(times_raw) else None
-
-        dt_span = (t_next - t_prev) if (t_next is not None and t_prev is not None) else 1.0
+        r_prev = rpm_all[i_prev] if i_prev < len(rpm_all) else None
+        r_curr = rpm_all[i_curr] if i_curr < len(rpm_all) else None
+        r_next = rpm_all[i_next] if i_next < len(rpm_all) else None
         if (
-            r_cur == 0
-            and r_prev is not None and r_prev >= 1100
-            and r_next is not None and r_next >= 1100
-            and dt_span <= 3.0
+            r_prev is not None
+            and r_curr is not None
+            and r_next is not None
+            and r_prev >= 1100
+            and r_curr == 0
+            and r_next >= 900
         ):
-            ckp_glitches.append((t_cur, r_prev, r_next, spd_cur))
+            t = time_all[i_curr] if i_curr < len(time_all) else 0.0
+            spd = spd_all[i_curr] if i_curr < len(spd_all) else 0.0
+            dropouts.append((t, r_prev, spd))
 
-    # 2. Рабочий диапазон УОЗ при работающем двигателе
-    target_idx = run_idx if run_idx else valid_idx
-    igns = sub(ign_all, target_idx)
-    ign_min = min(igns) if igns else None
-    ign_max = max(igns) if igns else None
-    ign_span = (ign_max - ign_min) if (ign_min is not None and ign_max is not None) else None
+    idx_pool = run_idx if run_idx else valid_idx
+    ign_sub = sub(ign_all, idx_pool)
+    unbal_sub = sub(unbal_all, idx_pool)
 
-    crank_stds = sub(crank_std_all, target_idx)
-    max_crank_std = max(crank_stds) if crank_stds else None
-
-    ign_stuck = (ign_span is not None and len(igns) >= 30 and ign_span < 4.5)
-
-    if len(ckp_glitches) >= 2:
-        st, badge = "status-bad", "СБОЙ ДПКВ"
-    elif len(ckp_glitches) == 1:
-        st, badge = "status-warn", "ПРОВАЛ ДПКВ"
-    elif ign_stuck:
-        st, badge = "status-warn", "ЗАЛИП УОЗ"
-    else:
-        st, badge = "status-ok", "НОРМА"
-
-    ckp_txt = (
-        f"Срывов ДПКВ: {len(ckp_glitches)}"
-        if ckp_glitches
-        else "Сигнал ДПКВ: стабилен (0 срывов)"
-    )
-    ign_txt = (
-        f" | УОЗ: {ign_min:.1f}..{ign_max:.1f}° (размах {ign_span:.1f}°)"
-        if ign_span is not None
-        else ""
-    )
-
-    tooltip_lines = [
-        f"Обнаружено мгновенных срывов оборотов в 0 на ходу: {len(ckp_glitches)}",
-    ]
-    for idx_g, (tg, rp, rn, sp) in enumerate(ckp_glitches[:5], 1):
-        t_s = f"{tg:.1f} с" if tg is not None else "?"
-        sp_s = f", скорость {sp:.0f} км/ч" if sp > 0 else ""
-        tooltip_lines.append(f"  • Срыв #{idx_g} на {t_s}: {rp} → 0 → {rn} об/мин{sp_s}")
-    if ign_span is not None:
-        tooltip_lines.append(
-            f"Диапазон УОЗ при работе двигателя ({len(igns)} кадр.): {ign_min:.1f} .. {ign_max:.1f} °ПКВ (размах {ign_span:.1f}°)"
+    if not ign_sub and not dropouts:
+        return _make_card(
+            title="ДПКВ и динамика УОЗ",
+            val="Нет данных",
+            norm="Без срывов ДПКВ | Размах УОЗ > 5°",
+            status="status-na",
         )
-    if max_crank_std is not None:
-        tooltip_lines.append(f"Макс. неравномерность вращения коленвала: {max_crank_std:.1f} об/с²")
 
-    return {
-        "title": "ДПКВ и динамика УОЗ",
-        "badge": badge,
-        "status": st,
-        "val": f"{ckp_txt}{ign_txt}",
-        "norm": "Норма: 0 срывов ДПКВ; рабочий размах УОЗ ≥ 8–15 °ПКВ",
-        "tooltip": "\n".join(tooltip_lines),
-    }
+    ign_span = (max(ign_sub) - min(ign_sub)) if len(ign_sub) >= 10 else None
+    ign_min = min(ign_sub) if ign_sub else 0.0
+    ign_max = max(ign_sub) if ign_sub else 0.0
+    max_unbal = max(unbal_sub) if unbal_sub else None
+
+    if dropouts:
+        status = "status-bad"
+        badge = "СБОЙ ДПКВ"
+        val = f"Срывов ДПКВ: {len(dropouts)}"
+    elif ign_span is not None and len(ign_sub) >= 40 and ign_span < 4.5:
+        status = "status-warn"
+        badge = "ЗАЛИП УОЗ"
+        val = f"Размах УОЗ {ign_span:.1f}°"
+    else:
+        status = "status-ok"
+        badge = "НОРМА"
+        val = (
+            f"УОЗ {ign_min:.0f}..{ign_max:.0f}°"
+            if ign_sub
+            else "Сигнал ДПКВ ровный"
+        )
+
+    norm = "Срывов ДПКВ: 0"
+    if max_unbal is not None:
+        norm += f" | Макс. неравном.: {max_unbal:.2f}"
+
+    tip_lines = [
+        f"Мгновенных срывов оборотов в 0 на ходу (ДПКВ): {len(dropouts)}.",
+    ]
+    if dropouts:
+        for t, rp, sp in dropouts[:5]:
+            tip_lines.append(
+                f"• {fmt_sec(t)}: провал оборотов с {rp:.0f} до 0 об/мин (скорость {sp:.0f} км/ч)"
+            )
+    if ign_sub:
+        tip_lines.append(
+            (f"Рабочий диапазон УОЗ: от {ign_min:.1f}° до {ign_max:.1f}° (размах {ign_span:.1f}°)." if ign_span is not None else "Данные УОЗ на рабочем участке отсутствуют.")
+        )
+
+    return _make_card(
+        title="ДПКВ и динамика УОЗ",
+        val=val,
+        norm=norm,
+        status=status,
+        badge=badge,
+        tooltip="\n".join(tip_lines),
+    )
+
+
+def check_throttle_cascade_response(
+    table: pa.Table,
+    valid_idx: list[int],
+    run_idx: list[int] | None = None,
+    hot_idle_idx: list[int] | None = None,
+) -> dict:
+    """Каскадная проверка отклика на резкий газ: ДПДЗ -> ДМРВ -> Впрыск -> Обороты."""
+    tps_all = col_vals(table, COL["TPS"])
+    maf_all = col_vals(table, COL["MAF"])
+    inj_all = col_vals(table, COL["INJ"])
+    rpm_all = col_vals(table, COL["RPM"])
+    time_all = col_vals(table, COL["TIME"])
+
+    if not tps_all or not rpm_all or len(valid_idx) < 15:
+        return _make_card(
+            title="Отклик на резкий газ",
+            val="Нет данных",
+            norm="Цепочка ДПДЗ → ДМРВ → Впрыск → Обороты",
+            status="status-na",
+        )
+
+    events = []
+    anomalies = []
+    last_event_t = -10.0
+
+    for pos in range(1, len(valid_idx) - 2):
+        i0 = valid_idx[pos - 1]
+        i1 = valid_idx[pos]
+        t0 = time_all[i0] if i0 < len(time_all) and time_all[i0] is not None else float(pos - 1)
+        t1 = time_all[i1] if i1 < len(time_all) and time_all[i1] is not None else float(pos)
+        if t1 - last_event_t < 2.0 or (t1 - t0) > 1.0:
+            continue
+
+        tps0 = tps_all[i0] if i0 < len(tps_all) else None
+        tps1 = tps_all[i1] if i1 < len(tps_all) else None
+        rpm0 = rpm_all[i0] if i0 < len(rpm_all) else None
+        if tps0 is None or tps1 is None or rpm0 is None:
+            continue
+
+        # Резкое открытие дросселя от малых углов на работающем двигателе
+        if rpm0 >= 650 and rpm0 <= 3800 and tps0 <= 22.0 and (tps1 - tps0) >= 14.0:
+            last_event_t = t1
+            maf0 = maf_all[i0] if i0 < len(maf_all) else None
+            inj0 = inj_all[i0] if i0 < len(inj_all) else None
+
+            win_maf = []
+            win_inj = []
+            win_rpm = []
+            for p2 in range(pos, len(valid_idx)):
+                j = valid_idx[p2]
+                tj = time_all[j] if j < len(time_all) and time_all[j] is not None else float(p2)
+                if tj - t1 > 1.3:
+                    break
+                if j < len(maf_all) and maf_all[j] is not None:
+                    win_maf.append(maf_all[j])
+                if j < len(inj_all) and inj_all[j] is not None:
+                    win_inj.append(inj_all[j])
+                if j < len(rpm_all) and rpm_all[j] is not None:
+                    win_rpm.append(rpm_all[j])
+
+            if not win_rpm:
+                continue
+
+            min_rpm = min(win_rpm)
+            max_rpm = max(win_rpm)
+            rpm_dip = rpm0 - min_rpm
+            rpm_gain = max_rpm - rpm0
+
+            maf_ok = True
+            if maf0 is not None and win_maf:
+                maf_gain = max(win_maf) - maf0
+                if maf_gain < max(5.0, maf0 * 0.20):
+                    maf_ok = False
+
+            inj_ok = True
+            if inj0 is not None and win_inj:
+                inj_gain = max(win_inj) - inj0
+                if inj_gain < max(0.8, inj0 * 0.15):
+                    inj_ok = False
+
+            events.append((t1, tps0, tps1, rpm0, max_rpm, rpm_dip, maf_ok, inj_ok))
+
+            reasons = []
+            if rpm_dip >= 75:
+                reasons.append(f"провал -{rpm_dip:.0f} об/мин")
+            if not maf_ok:
+                reasons.append("слабый прирост ДМРВ")
+            if not inj_ok:
+                reasons.append("нет обогащения впрыска")
+            if rpm_gain < 90 and rpm_dip < 75:
+                reasons.append(f"вялый набор (+{rpm_gain:.0f} об/мин)")
+
+            if reasons:
+                anomalies.append((t1, tps0, tps1, ", ".join(reasons)))
+
+    if not events:
+        return _make_card(
+            title="Отклик на резкий газ",
+            val="Нет резких нажатий",
+            norm="Не было резкого открытия ДПДЗ (≥14%)",
+            status="status-na",
+            tooltip="В логе не зафиксировано резких открытий дроссельной заслонки с малых углов.",
+        )
+
+    bad_ratio = len(anomalies) / len(events)
+    if len(anomalies) >= 2 and bad_ratio >= 0.5:
+        status = "status-warn"
+        badge = "ПРОВАЛ ПРИ ГАЗЕ"
+        val = f"Сбоев: {len(anomalies)} из {len(events)}"
+    elif anomalies:
+        status = "status-ok"
+        badge = "НОРМА"
+        val = f"Чётко: {len(events) - len(anomalies)} из {len(events)}"
+    else:
+        status = "status-ok"
+        badge = "НОРМА"
+        val = f"Все {len(events)} нажатий чётко"
+
+    norm = "Цепочка ДПДЗ → ДМРВ → Впрыск → Обороты"
+    tip_lines = [
+        f"Проанализировано резких открытий дросселя (≥14%): {len(events)}.",
+    ]
+    if anomalies:
+        tip_lines.append("Зафиксированы задержки/провалы отклика:")
+        for t, a0, a1, rsn in anomalies[:5]:
+            tip_lines.append(f"• {fmt_sec(t)} (ДПДЗ {a0:.0f}%→{a1:.0f}%): {rsn}")
+    else:
+        for t, a0, a1, r0, rmax, *_ in events[:4]:
+            tip_lines.append(
+                f"• {fmt_sec(t)} (ДПДЗ {a0:.0f}%→{a1:.0f}%): отклик оборотов {r0:.0f} → {rmax:.0f} об/мин"
+            )
+
+    return _make_card(
+        title="Отклик на резкий газ",
+        val=val,
+        norm=norm,
+        status=status,
+        badge=badge,
+        tooltip="\n".join(tip_lines),
+    )
