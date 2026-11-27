@@ -1,0 +1,385 @@
+# =============================================================================
+# ECUScope — Декларативные правила топливной системы и экологии (Bosch M7.9.7)
+# Формат: чистые шаблоны oscillation / compare_modes / threshold (без Python-кода)
+# =============================================================================
+
+sections:
+  - id: fuel_and_ecology
+    title: "Топливная система, ДК1/ДК2, КПА и катализатор"
+    order: 40
+    checks:
+      # 1. Датчики кислорода (ДК1 / ДК2): период, размах и Closed Loop
+      - id: oxygen_sensors
+        title: "Датчики кислорода (ДК1 / ДК2)"
+        type: oscillation
+        mode: running
+        where: "ECT >= 65 and RPM >= 650"
+        param: O2_1
+        high_threshold: 0.55
+        low_threshold: 0.35
+        max_gap_sec: 2.5
+        min_samples: 20
+        norm: "0.10–0.85 В; период ≤ 1.5 с; CL > 70%"
+        focus_traces: ["O2_1", "O2_2", "FR", "O2_FB1"]
+        if_empty:
+          val: "Мало данных"
+          status: warn
+          badge: "МАЛО ДАННЫХ"
+          tip: "Недостаточно кадров прогретого двигателя (ТОЖ ≥ 65 °C) для оценки ДК1 и Closed Loop."
+        rules:
+          - when: "swing < 0.25"
+            status: bad
+            badge: "ЗАВИС ДК1"
+            tags: ["o2_fault", "o2_stuck"]
+            val: "[ЗАВИС ДК1] {min:.2f}–{max:.2f} В (циклов: {cycles})"
+            tip: "Размах ДК1: {min:.2f}–{max:.2f} В (амплитуда {swing:.2f} В). Сигнал датчика кислорода замер и не переключается — проверьте ДК1, проводку и подсос воздуха."
+
+          - when: "period != None and period > 2.4"
+            status: bad
+            badge: "СТАРЕНИЕ ДК1"
+            tags: ["o2_fault", "o2_slow"]
+            val: "[СТАРЕНИЕ ДК1] {min:.2f}–{max:.2f} В (T={period:.2f}с)"
+            tip: "Размах ДК1: {min:.2f}–{max:.2f} В. Медианный период переключений: {period:.2f} с (норма ≤ 1.5 с) — критическая деградация лямбда-зонда."
+
+          - when: "swing < 0.50"
+            status: warn
+            badge: "ВЯЛЫЙ ДК1"
+            tags: ["o2_fault"]
+            val: "[ВЯЛЫЙ ДК1] {min:.2f}–{max:.2f} В"
+            tip: "Размах ДК1: {min:.2f}–{max:.2f} В (амплитуда {swing:.2f} В) — сниженная амплитуда сигнала управляющего датчика кислорода."
+
+          - when: "period != None and period > 1.5"
+            status: warn
+            badge: "МЕДЛЕННЫЙ ДК1"
+            tags: ["o2_fault", "o2_slow"]
+            val: "[МЕДЛЕННЫЙ ДК1] {min:.2f}–{max:.2f} В (T={period:.2f}с)"
+            tip: "Размах ДК1: {min:.2f}–{max:.2f} В. Медианный период переключений: {period:.2f} с (норма ≤ 1.5 с) — замедленный отклик ДК1."
+
+          - default:
+            status: ok
+            badge: "НОРМА"
+            val: "{min:.2f}–{max:.2f} В (циклов: {cycles})"
+            tip: "Размах ДК1: {min:.2f}–{max:.2f} В (амплитуда {swing:.2f} В, переключений: {cycles}). Управляющий датчик кислорода работает штатно."
+
+      # 2. Продувка адсорбера (КПА): сдвиг смеси, ранняя продувка и раскачка ХХ
+      - id: purge_valve
+        title: "Продувка адсорбера (КПА)"
+        type: compare_modes
+        require_all: false
+        min_samples: 5
+        norm: "Прогретый ДВС; ΔFR ≤ 8%"
+        focus_traces: ["PURGE", "FR", "RPM", "ECT"]
+        inputs:
+          max_duty:
+            mode: running
+            param: PURGE
+            agg: max
+            where: "PURGE >= 5 or PURGE_FLAG > 0.5"
+          active_cnt:
+            mode: running
+            param: PURGE
+            agg: count
+            where: "PURGE >= 5 or PURGE_FLAG > 0.5"
+          cold_cnt:
+            mode: running
+            param: ECT
+            agg: count
+            where: "(PURGE >= 5 or PURGE_FLAG > 0.5) and ECT < 55"
+          fr_act:
+            mode: running
+            param: FR
+            agg: median
+            min_samples: 8
+            where: "(PURGE >= 5 or PURGE_FLAG > 0.5) and ECT >= 65 and FR > 0.5 and FR < 1.6"
+          fr_inact:
+            mode: running
+            param: FR
+            agg: median
+            min_samples: 8
+            where: "PURGE < 5 and (PURGE_FLAG == None or PURGE_FLAG <= 0.5) and ECT >= 65 and FR > 0.5 and FR < 1.6"
+          idle_spread:
+            mode: running
+            param: RPM
+            agg: spread
+            min_samples: 8
+            where: "(PURGE >= 5 or PURGE_FLAG > 0.5) and ECT >= 70 and SPD < 2 and RPM >= 680 and RPM <= 1250"
+        compute:
+          delta_fr_pct: "(fr_act - fr_inact) * 100.0 if (fr_act != None and fr_inact != None) else 0.0"
+        rules:
+          - when: "active_cnt == None or active_cnt == 0"
+            status: ok
+            badge: "НЕ ВКЛЮЧАЛАСЬ"
+            val: "Не включалась (0%)"
+            tip: "За время записи клапан продувки адсорбера не активировался (норма для коротких или холодных поездок)."
+
+          - when: "abs(delta_fr_pct) >= 15.0"
+            status: bad
+            badge: "СДВИГ СМЕСИ КПА"
+            tags: ["purge_fault", "rich_mix"]
+            val: "[СДВИГ СМЕСИ КПА] макс {max_duty:.0f}%, ΔFR {delta_fr_pct:+.1f}%"
+            tip: "Максимальная скважность КПА: {max_duty:.0f}%. Сдвиг коррекции смеси FR при продувке составил {delta_fr_pct:+.1f}% — сильное переобогащение парами топлива или подсос через магистраль адсорбера."
+
+          - when: "cold_cnt != None and cold_cnt >= 4"
+            status: warn
+            badge: "ПРОДУВКА НА ХОЛОДНУЮ"
+            tags: ["purge_fault", "air_leak"]
+            val: "[ПРОДУВКА НА ХОЛОДНУЮ] макс {max_duty:.0f}%, ΔFR {delta_fr_pct:+.1f}%"
+            tip: "Обнаружена активность продувки на непрогретом двигателе (ТОЖ < 55 °C) — возможен подсос через подклинивающий клапан КПА."
+
+          - when: "idle_spread != None and idle_spread >= 75.0"
+            status: warn
+            badge: "РАСКАЧКА ХХ ПРИ КПА"
+            tags: ["purge_fault", "iac_hunt"]
+            val: "[РАСКАЧКА ХХ ПРИ КПА] макс {max_duty:.0f}%, размах {idle_spread:.0f} об/мин"
+            tip: "При продувке на холостом ходу разброс оборотов составил {idle_spread:.0f} об/мин (норма < 70 об/мин)."
+
+          - when: "abs(delta_fr_pct) >= 11.0"
+            status: warn
+            badge: "СДВИГ СМЕСИ КПА"
+            tags: ["purge_fault"]
+            val: "[СДВИГ СМЕСИ КПА] макс {max_duty:.0f}%, ΔFR {delta_fr_pct:+.1f}%"
+            tip: "Максимальная скважность КПА: {max_duty:.0f}%. Изменение коррекции смеси при продувке: {delta_fr_pct:+.1f}% (норма ≤ 8%)."
+
+          - default:
+            status: ok
+            badge: "НОРМА"
+            val: "макс {max_duty:.0f}%, ΔFR {delta_fr_pct:+.1f}%"
+            tip: "Максимальная скважность КПА: {max_duty:.0f}%. Изменение коррекции смеси при продувке: {delta_fr_pct:+.1f}%. Продувка работает штатно без раскачки ХХ."
+
+      # 3. Баланс смеси: прогретый ХХ против движения 1500+ об/мин
+      - id: mixture_differential
+        title: "Баланс смеси: ХХ vs 1500+"
+        type: compare_modes
+        require_all: true
+        min_samples: 15
+        norm: "FR 0.93–1.07 на всех режимах"
+        focus_traces: ["FR", "RPM", "TPS", "MAF"]
+        inputs:
+          med_idle:
+            mode: valid
+            param: FR
+            agg: median
+            where: "ECT >= 75 and RPM >= 680 and RPM <= 1020 and SPD < 2 and TPS < 2 and FR >= 0.65 and FR <= 1.45 and (O2_FB1 == None or O2_FB1 >= 0.5)"
+          med_cruise:
+            mode: valid
+            param: FR
+            agg: median
+            where: "ECT >= 75 and RPM >= 1500 and RPM <= 3200 and TPS >= 3 and TPS <= 45 and FR >= 0.65 and FR <= 1.45 and (O2_FB1 == None or O2_FB1 >= 0.5)"
+        compute:
+          diff: "med_idle - med_cruise"
+          idle_pct: "(med_idle - 1.0) * 100.0"
+          cruise_pct: "(med_cruise - 1.0) * 100.0"
+        if_empty:
+          val: "Мало режимов"
+          status: ok
+          badge: "МАЛО РЕЖИМОВ"
+          tip: "В логе недостаточно совместных участков прогретого ХХ и движения на 1500–3200 об/мин для сравнения."
+        rules:
+          - when: "med_idle >= 1.12 and diff >= 0.045 and med_cruise < 1.06"
+            status: bad
+            badge: "ПОДСОС НА ХХ"
+            tags: ["air_leak", "lean_mix"]
+            val: "[ПОДСОС НА ХХ] ХХ {med_idle:.3f} / 1500+ {med_cruise:.3f}"
+            tip: "FR на ХХ: {med_idle:.3f} ({idle_pct:+.1f}%), на 1500–3200 об/мин: {med_cruise:.3f} ({cruise_pct:+.1f}%). Сильное обеднение на ХХ с выравниванием на оборотах — явный признак подсоса воздуха за дросселем."
+
+          - when: "med_idle >= 1.07 and diff >= 0.045 and med_cruise < 1.06"
+            status: warn
+            badge: "ПОДСОС НА ХХ"
+            tags: ["air_leak", "lean_mix"]
+            val: "[ПОДСОС НА ХХ] ХХ {med_idle:.3f} / 1500+ {med_cruise:.3f}"
+            tip: "FR на ХХ: {med_idle:.3f} ({idle_pct:+.1f}%), на 1500–3200 об/мин: {med_cruise:.3f} ({cruise_pct:+.1f}%). На ХХ ЭБУ обогащает смесь, а на оборотах коррекция приходит в норму — проверьте впускной тракт на подсос."
+
+          - when: "med_idle >= 1.07 and med_cruise >= 1.08 and (med_idle >= 1.13 or med_cruise >= 1.13)"
+            status: bad
+            badge: "ДЕФИЦИТ ТОПЛИВА"
+            tags: ["lean_mix", "fuel_starvation"]
+            val: "[ДЕФИЦИТ ТОПЛИВА] ХХ {med_idle:.3f} / 1500+ {med_cruise:.3f}"
+            tip: "FR на ХХ: {med_idle:.3f} ({idle_pct:+.1f}%), на 1500+: {med_cruise:.3f} ({cruise_pct:+.1f}%). Критическое обеднение на всех режимах — проверьте давление топлива (насос, фильтр, РДТ), форсунки или ДМРВ."
+
+          - when: "med_idle >= 1.07 and med_cruise >= 1.08"
+            status: warn
+            badge: "ДЕФИЦИТ ТОПЛИВА"
+            tags: ["lean_mix", "fuel_starvation"]
+            val: "[ДЕФИЦИТ ТОПЛИВА] ХХ {med_idle:.3f} / 1500+ {med_cruise:.3f}"
+            tip: "FR на ХХ: {med_idle:.3f} ({idle_pct:+.1f}%), на 1500+: {med_cruise:.3f} ({cruise_pct:+.1f}%). Обеднение сохраняется и на ХХ, и на оборотах — проверьте топливоподачу и ДМРВ."
+
+          - when: "med_cruise >= 1.14 and med_idle < 1.06"
+            status: bad
+            badge: "БЕДНАЯ ПОД НАГРУЗКОЙ"
+            tags: ["lean_mix", "fuel_starvation"]
+            val: "[БЕДНАЯ ПОД НАГРУЗКОЙ] ХХ {med_idle:.3f} / 1500+ {med_cruise:.3f}"
+            tip: "FR на ХХ: {med_idle:.3f} ({idle_pct:+.1f}%), на 1500+: {med_cruise:.3f} ({cruise_pct:+.1f}%). На ХХ смесь в норме, но под нагрузкой резко беднится — проверьте бензонасос, сетку/фильтр и ДМРВ."
+
+          - when: "med_cruise >= 1.09 and med_idle < 1.06"
+            status: warn
+            badge: "БЕДНАЯ ПОД НАГРУЗКОЙ"
+            tags: ["lean_mix", "fuel_starvation"]
+            val: "[БЕДНАЯ ПОД НАГРУЗКОЙ] ХХ {med_idle:.3f} / 1500+ {med_cruise:.3f}"
+            tip: "FR на ХХ: {med_idle:.3f} ({idle_pct:+.1f}%), на 1500+: {med_cruise:.3f} ({cruise_pct:+.1f}%). Уход в бедную смесь на повышенных оборотах — проверьте производительность топливного насоса и ДМРВ."
+
+          - when: "med_idle <= 0.86 and med_cruise <= 0.86"
+            status: bad
+            badge: "БОГАТАЯ СМЕСЬ"
+            tags: ["rich_mix"]
+            val: "[БОГАТАЯ СМЕСЬ] ХХ {med_idle:.3f} / 1500+ {med_cruise:.3f}"
+            tip: "FR на ХХ: {med_idle:.3f} ({idle_pct:+.1f}%), на 1500+: {med_cruise:.3f} ({cruise_pct:+.1f}%). Сильное переобогащение на всех режимах — проверьте герметичность форсунок, РДТ и КПА."
+
+          - when: "med_idle <= 0.91 and med_cruise <= 0.91"
+            status: warn
+            badge: "БОГАТАЯ СМЕСЬ"
+            tags: ["rich_mix"]
+            val: "[БОГАТАЯ СМЕСЬ] ХХ {med_idle:.3f} / 1500+ {med_cruise:.3f}"
+            tip: "FR на ХХ: {med_idle:.3f} ({idle_pct:+.1f}%), на 1500+: {med_cruise:.3f} ({cruise_pct:+.1f}%). Устойчивое переобогащение смеси — проверьте форсунки, давление топлива и ДТОЖ/ДМРВ."
+
+          - default:
+            status: ok
+            badge: "НОРМА"
+            val: "ХХ {med_idle:.3f} / 1500+ {med_cruise:.3f}"
+            tip: "Медианный коэффициент FR на прогретом ХХ: {med_idle:.3f} ({idle_pct:+.1f}%), на оборотах 1500–3200 об/мин: {med_cruise:.3f} ({cruise_pct:+.1f}%). Коррекция сбалансирована."
+
+      # 4. Эффективность катализатора по сигналу ДК2
+      - id: catalyst_efficiency
+        title: "Катализатор (по ДК2)"
+        type: compare_modes
+        require_all: false
+        min_samples: 20
+        norm: "ДК2 0.55–0.80 В; размах ≤ 0.25 В"
+        focus_traces: ["O2_2", "O2_1", "CAT_AMP_IDX"]
+        inputs:
+          med_v:
+            mode: running
+            param: O2_2
+            agg: median
+            min_samples: 20
+            where: "ECT >= 75 and RPM >= 700 and O2_2 > 0.02 and O2_2 < 1.3"
+          span:
+            mode: running
+            param: O2_2
+            agg: p10_p90
+            min_samples: 20
+            where: "ECT >= 75 and RPM >= 700 and O2_2 > 0.02 and O2_2 < 1.3"
+          raw_spread:
+            mode: running
+            param: O2_2
+            agg: spread
+            min_samples: 20
+            where: "ECT >= 75 and RPM >= 700 and O2_2 > 0.02 and O2_2 < 1.3"
+          med_amp:
+            mode: running
+            param: CAT_AMP_IDX
+            agg: median
+            min_samples: 5
+            where: "ECT >= 75 and RPM >= 700 and CAT_AMP_IDX > 0"
+        rules:
+          - when: "med_v == None or span == None"
+            status: ok
+            badge: "ЕВРО-2 / НЕТ ДК2"
+            val: "Нет сигнала ДК2"
+            tip: "Сигнал второго датчика кислорода отсутствует или датчик программно отключён (Евро-2)."
+
+          - when: "raw_spread < 0.03 and med_v >= 0.40 and med_v <= 0.50"
+            status: ok
+            badge: "ЕВРО-2"
+            val: "Отключён (Евро-2)"
+            tip: "Напряжение ДК2 стабильно на опорном уровне {med_v:.2f} В (конфигурация без диагностики катализатора)."
+
+          - when: "span > 0.45 or (med_amp != None and med_amp > 0.65)"
+            status: bad
+            badge: "НИЗКАЯ ЭФФЕКТИВНОСТЬ"
+            tags: ["catalyst_low"]
+            val: "[НИЗКАЯ ЭФФЕКТИВНОСТЬ] {med_v:.2f} В (размах {span:.2f} В)"
+            tip: "Медианное напряжение ДК2: {med_v:.2f} В, рабочий размах (P10–P90): {span:.2f} В. Сигнал ДК2 повторяет колебания первого датчика — снижена кислородная ёмкость катализатора."
+
+          - when: "span > 0.28 or (med_amp != None and med_amp > 0.45)"
+            status: warn
+            badge: "СНИЖЕНИЕ РЕСУРСА"
+            tags: ["catalyst_low"]
+            val: "[СНИЖЕНИЕ РЕСУРСА] {med_v:.2f} В (размах {span:.2f} В)"
+            tip: "Медианное напряжение ДК2: {med_v:.2f} В, рабочий размах (P10–P90): {span:.2f} В — повышенная амплитуда колебаний после катализатора."
+
+          - default:
+            status: ok
+            badge: "НОРМА"
+            val: "{med_v:.2f} В (размах {span:.2f} В)"
+            tip: "Медианное напряжение ДК2 на прогретом двигателе: {med_v:.2f} В, рабочий размах (P10–P90): {span:.2f} В. Нейтрализатор эффективно дожигает остаточный кислород."
+
+      # 5. Загрузка форсунок и дефицит топливоподачи под нагрузкой
+      - id: injectors_and_fuel_supply
+        title: "Форсунки и топливоподача"
+        type: compare_modes
+        require_all: false
+        min_samples: 5
+        norm: "Загрузка ≤ 80%; FR ≤ 1.08"
+        focus_traces: ["INJ_DUTY", "INJ", "FR", "RPM"]
+        inputs:
+          max_duty:
+            mode: running
+            param: INJ_DUTY
+            agg: max
+            min_samples: 10
+            where: "ECT >= 60 and RPM >= 650 and INJ_DUTY > 0 and INJ_DUTY <= 120"
+          calc_max_duty:
+            mode: running
+            param: INJ
+            agg: max
+            min_samples: 10
+            where: "ECT >= 60 and RPM >= 650 and INJ > 0"
+          load_fr:
+            mode: running
+            param: FR
+            agg: median
+            min_samples: 5
+            where: "ECT >= 60 and TPS >= 35 and RPM >= 2500 and FR >= 0.65 and FR <= 1.45"
+        compute:
+          duty_peak: "max_duty if max_duty != None else 0.0"
+        if_empty:
+          val: "Мало данных"
+          status: ok
+          badge: "МАЛО ДАННЫХ"
+          tip: "Недостаточно кадров прогретого двигателя для оценки топливоподачи."
+        rules:
+          - when: "max_duty == None and calc_max_duty == None"
+            status: ok
+            badge: "МАЛО ДАННЫХ"
+            val: "Мало данных"
+            tip: "Недостаточно кадров прогретого двигателя для оценки загрузки форсунок."
+
+          - when: "duty_peak >= 90.0"
+            status: bad
+            badge: "ПЕРЕГРУЗ ФОРСУНОК"
+            tags: ["fuel_starvation", "injector_overload"]
+            val: "[ПЕРЕГРУЗ ФОРСУНОК] пик {duty_peak:.1f}%"
+            tip: "Максимальная загрузка форсунок: {duty_peak:.1f}% (норма ≤ 80%). Форсунки работают на пределе — проверьте давление топлива в рампе и их производительность."
+
+          - when: "load_fr != None and load_fr >= 1.13"
+            status: bad
+            badge: "НЕХВАТКА ТОПЛИВА"
+            tags: ["fuel_starvation", "lean_mix"]
+            val: "[НЕХВАТКА ТОПЛИВА] пик {duty_peak:.1f}%, FR нагр. {load_fr:.3f}"
+            tip: "Максимальная загрузка форсунок: {duty_peak:.1f}%, коррекция FR под нагрузкой (ДПДЗ ≥ 35%, ≥ 2500 об/мин): {load_fr:.3f}. Критический дефицит топлива — проверьте бензонасос, фильтр и РДТ."
+
+          - when: "duty_peak >= 82.0"
+            status: warn
+            badge: "ВЫСОКАЯ ЗАГРУЗКА"
+            tags: ["injector_overload"]
+            val: "[ВЫСОКАЯ ЗАГРУЗКА] пик {duty_peak:.1f}%"
+            tip: "Максимальная загрузка форсунок за поездку: {duty_peak:.1f}% (норма ≤ 80%). Повышенная длительность впрыска под нагрузкой."
+
+          - when: "load_fr != None and load_fr >= 1.08"
+            status: warn
+            badge: "БЕДНО ПОД НАГРУЗКОЙ"
+            tags: ["fuel_starvation", "lean_mix"]
+            val: "[БЕДНО ПОД НАГРУЗКОЙ] пик {duty_peak:.1f}%, FR нагр. {load_fr:.3f}"
+            tip: "Максимальная загрузка форсунок: {duty_peak:.1f}%, коррекция FR под нагрузкой: {load_fr:.3f}. Заметное обогащение под нагрузкой — проверьте давление топлива и ДМРВ."
+
+          - when: "load_fr != None"
+            status: ok
+            badge: "НОРМА"
+            val: "пик {duty_peak:.1f}%, FR нагр. {load_fr:.3f}"
+            tip: "Максимальная загрузка форсунок: {duty_peak:.1f}% (норма ≤ 80%), коррекция FR под нагрузкой: {load_fr:.3f}. Топливоподача в норме во всех режимах."
+
+          - default:
+            status: ok
+            badge: "НОРМА"
+            val: "пик {duty_peak:.1f}%"
+            tip: "Максимальная загрузка форсунок за поездку: {duty_peak:.1f}% (норма ≤ 80%). Производительности форсунок достаточно."

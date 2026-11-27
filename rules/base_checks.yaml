@@ -1,0 +1,423 @@
+order: 10
+name: Базовые проверки ЭБУ
+checks:
+- id: engine_start
+  title: Пуск и прокрутка
+  type: event_window
+  norm: 'Норма прокрутки: ≤ 2.0 с; АКБ при пуске ≥ 9.5 В'
+  focus_traces:
+  - RPM
+  - VBAT
+  - ECT
+  trigger:
+    where: 40 <= RPM <= 440
+    transition: 'RPM: < 40 -> >= 40'
+    cooldown_sec: 3.0
+  window:
+    duration_sec: 8.0
+    until: RPM >= 480 or RPM == 0
+    metrics:
+      crank_dur: duration
+      min_vbat: min(VBAT)
+      ect_start: first(ECT_START)
+      ect_end: last(ECT)
+      started: any(RPM_end >= 480)
+  if_empty:
+    status: status-na
+    badge: БЕЗ ПРОКРУТКИ
+    val: Запись без прокрутки стартером
+    tip: В логе не зафиксирован момент вращения коленвала стартером (40..440 об/мин).
+  rules:
+  - when: count(not started) > 0 or max(crank_dur) > 4.0 or min(min_vbat) < 8.8
+    status: status-bad
+    badge: ТЯЖЁЛЫЙ ПУСК
+    tags:
+    - hard_start
+    - weak_battery
+    val: 'Прокрутка: {max(crank_dur):.2f} с ({total_events} поп.) | АКБ мин {min(min_vbat):.1f}
+      В'
+    tip: Затяжная или неудачная прокрутка стартером либо критическая просадка АКБ
+      при пуске.
+  - when: max(crank_dur) > 2.0 or min(min_vbat) < 9.5
+    status: status-warn
+    badge: ЗАТЯЖНОЙ
+    tags:
+    - hard_start
+    val: 'Прокрутка: {max(crank_dur):.2f} с | АКБ мин {min(min_vbat):.1f} В'
+    tip: Увеличенное время прокрутки стартером (> 2.0 с) или просадка напряжения АКБ
+      ниже 9.5 В.
+  - default: null
+    status: status-ok
+    badge: НОРМА
+    val: 'Прокрутка: {max(crank_dur):.2f} с | АКБ мин {min(min_vbat):.1f} В'
+    tip: Двигатель запустился уверенно, просадка напряжения АКБ в пределах нормы.
+- id: vbat_running
+  title: Напряжение сети
+  type: threshold
+  mode: running
+  param: VBAT
+  agg: median
+  min_samples: 5
+  norm: 'Норма при работе: 13.5 – 14.6 В'
+  focus_traces:
+  - VBAT
+  - RPM
+  val_fmt: '{val:.2f} В (мин {min:.2f}, макс {max:.2f})'
+  rules:
+  - when: 13.4 <= val <= 14.7 and min >= 12.8
+    status: status-ok
+    badge: НОРМА
+    tip: Напряжение бортсети стабильно, генератор и регулятор напряжения работают
+      штатно.
+    val: '{val:.2f} В (мин. {min:.2f} В)'
+  - when: 12.5 <= val <= 15.0
+    status: status-warn
+    badge: ОТКЛОНЕНИЕ
+    tags:
+    - low_voltage
+    tip: Небольшое отклонение напряжения бортсети — проверьте натяжение ремня генератора,
+      щётки и силовые массы.
+    val: '{val:.2f} В (мин. {min:.2f} В)'
+  - default: null
+    status: status-bad
+    badge: КРИТИЧНО
+    tags:
+    - low_voltage
+    - charging_fault
+    tip: Критическое напряжение бортсети — недозаряд АКБ или перезаряд из-за неисправности
+      регулятора напряжения.
+    val: '{val:.2f} В (мин. {min:.2f} В)'
+- id: ect_range
+  title: Температура ОЖ (ДТОЖ)
+  type: threshold
+  mode: valid
+  param: ECT
+  agg: max
+  min_samples: 5
+  norm: 'Рабочая норма: 82 – 103 °C'
+  focus_traces:
+  - ECT
+  - FAN1
+  - SPD
+  val_fmt: от {min:.1f} до {max:.1f} °C
+  rules:
+  - when: max > 108.0
+    status: status-bad
+    badge: ПЕРЕГРЕВ
+    tags:
+    - overheat
+    tip: Перегрев двигателя (> 108 °C) — проверьте работу вентилятора, уровень ОЖ,
+      термостат и чистоту радиатора.
+  - when: max < 78.0
+    status: status-warn
+    badge: НЕДОГРЕВ
+    tags:
+    - underheat
+    tip: Двигатель не вышел на рабочую температуру (< 78 °C) — короткая поездка или
+      открытый термостат.
+  - when: max > 104.0
+    status: status-warn
+    badge: ВЫСОКАЯ
+    tags:
+    - high_temp
+    tip: Повышенная температура ОЖ (> 104 °C) — проверьте порог включения вентилятора
+      охлаждения.
+  - default: null
+    status: status-ok
+    badge: НОРМА
+    tip: Тепловой режим двигателя находится в штатном рабочем диапазоне.
+- id: idle_rpm_hot
+  title: Обороты ХХ (прогрет)
+  type: threshold
+  mode: hot_idle
+  param: RPM
+  agg: median
+  min_samples: 5
+  norm: 'Норма ХХ: 780 – 860 об/мин'
+  focus_traces:
+  - RPM
+  - RPM_DESIRED
+  - IAC
+  val_fmt: '{val:.0f} об/мин ({min:.0f}..{max:.0f})'
+  if_empty:
+    status: status-na
+    badge: НЕТ ДАННЫХ
+    val: Нет кадров прогретого ХХ (≥75 °C)
+    tip: В поездке не было остановок на прогретом двигателе для замера холостого хода.
+  rules:
+  - when: 760 <= val <= 880
+    status: status-ok
+    badge: НОРМА
+    tip: Обороты прогретого холостого хода соответствуют норме.
+  - when: 700 <= val <= 950
+    status: status-warn
+    badge: ОТКЛОНЕНИЕ
+    tags:
+    - idle_drift
+    tip: Отклонение оборотов прогретого ХХ — проверьте чистоту дроссельного узла,
+      РХХ и отсутствие подсоса воздуха.
+  - default: null
+    status: status-bad
+    badge: ВНЕ НОРМЫ
+    tags:
+    - idle_fault
+    tip: Обороты прогретого ХХ сильно выходят за допустимые границы.
+- id: rpm_dips_and_stalls
+  title: Провалы оборотов
+  type: event_window
+  norm: 'Порог риска заглохнуть: < 560 об/мин'
+  focus_traces:
+  - RPM
+  - IAC
+  - TPS
+  - SPD
+  trigger:
+    where: ECT >= 70 and 440 <= RPM <= 680
+    transition: 'RPM: >= 720 -> <= 680'
+    cooldown_sec: 4.0
+  window:
+    duration_sec: 3.5
+    until: RPM >= 720
+    metrics:
+      min_rpm: min(RPM)
+      stalled: any(RPM == 0)
+  if_empty:
+    status: status-ok
+    badge: НОРМА
+    val: 'Случаев провала ниже 680 об/мин: 0'
+    tip: Провалов оборотов на прогретом двигателе не зафиксировано.
+  rules:
+  - when: count(stalled) > 0
+    status: status-bad
+    badge: ЗАГЛОХ
+    tags:
+    - engine_stall
+    - rpm_dip
+    val: 'Остановок ДВС: {count(stalled)} | мин. {min(min_rpm):.0f} об/мин'
+    tip: Зафиксирована остановка прогретого двигателя (0 об/мин) с последующим запуском.
+  - when: min(min_rpm) <= 560
+    status: status-bad
+    badge: КРИТИЧНО
+    tags:
+    - rpm_dip
+    val: 'Случаев: {total_events} | мин. {min(min_rpm):.0f} об/мин'
+    tip: Глубокие провалы оборотов (≤ 560 об/мин) на грани остановки двигателя.
+  - default: null
+    status: status-warn
+    badge: ПРОСАДКИ
+    tags:
+    - rpm_dip
+    val: 'Случаев: {total_events} | мин. {min(min_rpm):.0f} об/мин'
+    tip: Зафиксированы кратковременные просадки оборотов ниже 680 об/мин.
+- id: maf_hot_idle
+  title: ДМРВ на прогретом ХХ
+  type: threshold
+  mode: hot_idle
+  param: MAF
+  agg: median
+  min_samples: 5
+  norm: 'Норма ХХ (1.5/1.6л): 8.0 – 11.0 кг/ч'
+  focus_traces:
+  - MAF
+  - RPM
+  - IAC
+  val_fmt: '{val:.1f} кг/ч ({min:.1f}..{max:.1f})'
+  rules:
+  - when: 7.5 <= val <= 11.5
+    status: status-ok
+    badge: НОРМА
+    tip: Массовый расход воздуха на прогретом ХХ в норме.
+  - when: 6.5 <= val <= 13.0
+    status: status-warn
+    badge: ОТКЛОНЕНИЕ
+    tags:
+    - maf_drift
+    tip: Отклонение расхода воздуха на ХХ — при занижении вероятен подсос мимо ДМРВ,
+      при завышении — дрейф датчика или высокие обороты.
+  - default: null
+    status: status-bad
+    badge: ВНЕ НОРМЫ
+    tags:
+    - maf_fault
+    tip: Расход воздуха на ХХ сильно выходит за норму — проверьте ДМРВ и герметичность
+      впуска.
+- id: fuel_rate_idle
+  title: Расход топлива на ХХ
+  type: threshold
+  mode: hot_idle
+  param: FUEL
+  agg: median
+  min_samples: 5
+  norm: 'Норма ХХ (прогрет): 0.65 – 0.95 л/ч'
+  focus_traces:
+  - FUEL
+  - INJ
+  - MAF
+  val_fmt: '{val:.2f} л/ч ({min:.2f}..{max:.2f})'
+  rules:
+  - when: 0.65 <= val <= 0.98
+    status: status-ok
+    badge: НОРМА
+    tip: Часовой расход топлива на прогретом холостом ходу в норме.
+  - when: 0.50 <= val <= 1.25
+    status: status-warn
+    badge: ОТКЛОНЕНИЕ
+    tags:
+    - fuel_rate_drift
+    tip: Отклонение часового расхода топлива на ХХ от типовых значений.
+  - default: null
+    status: status-bad
+    badge: ВНЕ НОРМЫ
+    tags:
+    - fuel_rate_fault
+    tip: Часовой расход топлива на ХХ существенно превышает норму.
+- id: inj_time_idle
+  title: Впрыск на прогретом ХХ
+  type: threshold
+  mode: hot_idle
+  param: INJ
+  agg: median
+  min_samples: 5
+  norm: 'Норма ХХ: 2.5 – 4.3 мс (фаз./попарн.)'
+  focus_traces:
+  - INJ
+  - FR
+  - MAF
+  val_fmt: '{val:.2f} мс ({min:.2f}..{max:.2f})'
+  rules:
+  - when: 2.4 <= val <= 4.4
+    status: status-ok
+    badge: НОРМА
+    tip: Длительность импульса впрыска на прогретом ХХ в норме.
+  - when: 2.0 <= val <= 5.0
+    status: status-warn
+    badge: ОТКЛОНЕНИЕ
+    tags:
+    - inj_drift
+    tip: Отклонение времени впрыска на ХХ — проверьте давление топлива в рампе и баланс
+      форсунок.
+  - default: null
+    status: status-bad
+    badge: ВНЕ НОРМЫ
+    tags:
+    - inj_fault
+    tip: Время впрыска на ХХ выходит за допустимые пределы.
+- id: ign_and_iac_idle
+  title: УОЗ и РХХ на ХХ
+  type: threshold
+  mode: hot_idle
+  expr: median('IGN', 'hot_idle')
+  norm: 'Норма: УОЗ 7..16°, РХХ 25..55 шаг'
+  focus_traces:
+  - IGN
+  - IAC
+  - RPM
+  val_fmt: УОЗ {val:.1f}° | РХХ {median('IAC', 'hot_idle'):.0f} шаг
+  rules:
+  - when: 6.0 <= val <= 17.0
+    status: status-ok
+    badge: НОРМА
+    tip: Угол опережения зажигания и положение РХХ на прогретом ХХ сбалансированы.
+  - default: null
+    status: status-warn
+    badge: ОТКЛОНЕНИЕ
+    tags:
+    - ign_idle_drift
+    tip: УОЗ на холостом ходу смещён — ЭБУ компенсирует нестабильность оборотов углом
+      зажигания.
+- id: mixture_corrections
+  title: Коррекции смеси
+  type: threshold
+  mode: running
+  expr: median('FR', 'running')
+  norm: 'Норма: FR/FRA 0.92..1.08, RKAT ±4%'
+  focus_traces:
+  - FR
+  - O2_1
+  - FRA
+  - RKAT
+  val_fmt: FR {val:.3f} | FRA {last('FRA', 'valid'):.3f} | RKAT {last('RKAT', 'valid'):+.1f}%
+  rules:
+  - when: 0.90 <= val <= 1.10 and 0.90 <= last('FRA', 'valid') <= 1.10 and abs(last('RKAT',
+      'valid')) <= 5.0
+    status: status-ok
+    badge: НОРМА
+    tip: Текущая и накопленные топливные коррекции находятся в зелёной зоне.
+  - when: 0.82 <= val <= 1.18 and 0.85 <= last('FRA', 'valid') <= 1.15 and abs(last('RKAT',
+      'valid')) <= 8.0
+    status: status-warn
+    badge: СМЕЩЕНИЕ
+    tags:
+    - lean_mix
+    tip: Умеренное смещение топливных коррекций — проверьте герметичность впуска,
+      ДМРВ и давление топлива.
+  - default: null
+    status: status-bad
+    badge: БЕДНАЯ/БОГАТАЯ
+    tags:
+    - lean_mix
+    - rich_mix
+    tip: Сильный уход топливных коррекций — ЭБУ упирается в пределы регулирования
+      состава смеси.
+- id: ecu_adaptations
+  title: Адаптации ЭБУ
+  type: threshold
+  mode: valid
+  expr: (last('FRA', 'valid') - 1.0) * 100.0
+  norm: 'Норма: FRA ±8%, RKAT ±4.5%, адаптация ХХ ±4.5%'
+  focus_traces:
+  - FRA
+  - RKAT
+  - IAC_ADAPT
+  val_fmt: FRA {val:+.1f}% | RKAT {last('RKAT', 'valid'):+.1f}% | ХХ {last('IAC_ADAPT',
+    'valid'):+.1f}%
+  rules:
+  - when: abs(val) > 15.0 or abs(last('RKAT', 'valid')) > 8.0 or abs(last('IAC_ADAPT',
+      'valid')) > 7.5
+    status: status-bad
+    badge: ПРЕДЕЛ АДАПТ.
+    tags:
+    - adapt_limit
+    tip: Накопленные коэффициенты самообучения ЭБУ достигли критических значений.
+  - when: abs(val) > 8.0 or abs(last('RKAT', 'valid')) > 4.5 or abs(last('IAC_ADAPT',
+      'valid')) > 4.5
+    status: status-warn
+    badge: СМЕЩЕНИЕ
+    tags:
+    - adapt_drift
+    tip: Накопленные адаптации ЭБУ смещены относительно заводского нуля.
+  - default: null
+    status: status-ok
+    badge: ОБУЧЕН
+    tip: Параметры самообучения смеси и холостого хода ЭБУ в норме.
+- id: errors_and_misfires
+  title: Ошибки и пропуски
+  type: threshold
+  mode: valid
+  expr: max('ERR', 'valid') + max('MIS_SUM', 'valid')
+  norm: 'Норма: 0 ошибок и 0 пропусков'
+  focus_traces:
+  - ERR
+  - MIS_SUM
+  - RPM
+  val_fmt: 'Ошибок ЭБУ: {max(''ERR'', ''valid''):.0f} | Пропусков: {max(''MIS_SUM'',
+    ''valid''):.0f}'
+  rules:
+  - when: max('ERR', 'valid') == 0 and max('MIS_SUM', 'valid') == 0
+    status: status-ok
+    badge: ЧИСТО
+    tip: Ошибок в памяти ЭБУ и пропусков воспламенения не зафиксировано.
+  - when: max('ERR', 'valid') == 0 and max('MIS_SUM', 'valid') <= 5
+    status: status-warn
+    badge: ЕДИНИЧНЫЕ
+    tags:
+    - misfires
+    tip: Зафиксированы единичные пропуски воспламенения (≤ 5) без занесения ошибки
+      в память.
+  - default: null
+    status: status-bad
+    badge: ВНИМАНИЕ
+    tags:
+    - ecu_errors
+    - misfires
+    tip: В памяти ЭБУ есть активные ошибки или множественные пропуски воспламенения.

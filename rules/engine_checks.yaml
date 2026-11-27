@@ -1,0 +1,182 @@
+# ECUScope — Декларативные правила диагностики зажигания, детонации, пропусков и динамики отклика (Bosch M7.9.7 / M7.9.7+)
+# Версия схемы: 2.0 (чистый декларативный формат без Python-кода)
+
+sections:
+  - id: engine_ignition_dynamics
+    title: "Зажигание, детонация, пропуски и отклик ДВС"
+    order: 40
+    checks:
+      # 1. Детонация и отскок УОЗ под нагрузкой
+      - id: knock_and_retard
+        title: "Детонация и отскок УОЗ"
+        type: event_window
+        mode: running
+        norm: "Отскок УОЗ под нагрузкой ≤ 4.0 °ПКВ"
+        focus_traces: ["RPM", "IGN", "KNOCK_RETARD", "LOAD"]
+        focus_metric: max_ret
+        trigger:
+          where: "KNOCK_RETARD > 0.5"
+          cooldown_sec: 1.5
+        window:
+          duration_sec: 1.0
+          metrics:
+            max_ret: "max(KNOCK_RETARD)"
+            peak_kv: "max(KNOCK_V)"
+            ep_rpm: "max(RPM)"
+            ep_load: "max(LOAD)"
+        if_empty:
+          status: status-ok
+          badge: "НОРМА"
+          val: "Отскок 0.0° (детонации нет)"
+          tip: "Детонационной коррекции УОЗ (>0.5 °ПКВ) за поездку не зафиксировано."
+        rules:
+          - when: "max(max_ret) >= 7.5 or count(max_ret >= 4.5) >= 10"
+            status: status-bad
+            badge: "ДЕТОНАЦИЯ"
+            tags: ["knock", "high_knock_retard"]
+            val: "Макс. отскок {max(max_ret):.1f}° ({total_events} эпиз.)"
+            tip: "Глубокий отскок УОЗ до {max(max_ret):.1f}° (эпизодов ≥4.5°: {count(max_ret >= 4.5)}, пик ДД: {max(peak_kv):.2f} В). Моменты: {times(max_ret >= 4.5)}. Проверьте октановое число топлива, температуру впуска и свечи."
+          - when: "max(max_ret) >= 4.5 or count(max_ret >= 4.5) >= 3"
+            status: status-warn
+            badge: "ОТБИВКА УОЗ"
+            tags: ["knock"]
+            val: "Макс. отскок {max(max_ret):.1f}° ({total_events} эпиз.)"
+            tip: "Зафиксирована коррекция УОЗ по детонации до {max(max_ret):.1f}° (эпизодов: {total_events}, моменты: {times(max_ret > 0.5)})."
+          - default: true
+            status: status-ok
+            badge: "НОРМА"
+            val: "Макс. отскок {max(max_ret):.1f}° ({total_events} эпиз.)"
+            tip: "Кратковременные отскоки УОЗ не превышают 4.0 °ПКВ (макс. {max(max_ret):.1f}°). Детонация в пределах штатного регулирования."
+
+      # 2. Пропуски воспламенения по цилиндрам 1-4 и пиковый расход ДМРВ
+      - id: misfire_and_peak_maf
+        title: "Пропуски и пик ДМРВ"
+        type: compare_modes
+        norm: "Норма: 0 пропусков по цилиндрам"
+        focus_traces: ["MIS_CYL_1", "MIS_CYL_2", "MIS_CYL_3", "MIS_CYL_4", "RPM", "MAF"]
+        require_all: false
+        inputs:
+          c1:
+            mode: running
+            param: MIS_CYL_1
+            agg: max
+          c2:
+            mode: running
+            param: MIS_CYL_2
+            agg: max
+          c3:
+            mode: running
+            param: MIS_CYL_3
+            agg: max
+          c4:
+            mode: running
+            param: MIS_CYL_4
+            agg: max
+          msum:
+            mode: running
+            param: MIS_SUM
+            agg: max
+          peak_maf:
+            mode: running
+            param: MAF
+            agg: max
+          peak_rpm:
+            mode: running
+            param: RPM
+            agg: max
+        compute:
+          v1: "c1 if c1 is not None else 0"
+          v2: "c2 if c2 is not None else 0"
+          v3: "c3 if c3 is not None else 0"
+          v4: "c4 if c4 is not None else 0"
+          vsum: "msum if msum is not None else (v1 + v2 + v3 + v4)"
+          total_cyl: "v1 + v2 + v3 + v4"
+          worst_cnt: "max_val(v1, v2, v3, v4)"
+        rules:
+          - when: "worst_cnt >= 15 or total_cyl >= 25 or vsum >= 25"
+            status: status-bad
+            badge: "ЕСТЬ ПРОПУСКИ"
+            tags: ["misfire"]
+            val: "Ц1-4: {v1:.0f}/{v2:.0f}/{v3:.0f}/{v4:.0f} (сумма {vsum:.0f})"
+            tip: "Критическое число пропусков воспламенения: Ц1={v1:.0f}, Ц2={v2:.0f}, Ц3={v3:.0f}, Ц4={v4:.0f} (общий счётчик: {vsum:.0f}). Проверьте свечи, катушки/модуль зажигания, компрессию и форсунки."
+          - when: "worst_cnt >= 3 or total_cyl >= 5 or vsum >= 5"
+            status: status-warn
+            badge: "ЕСТЬ ПРОПУСКИ"
+            tags: ["misfire"]
+            val: "Ц1-4: {v1:.0f}/{v2:.0f}/{v3:.0f}/{v4:.0f} (сумма {vsum:.0f})"
+            tip: "Зафиксированы единичные пропуски зажигания: Ц1={v1:.0f}, Ц2={v2:.0f}, Ц3={v3:.0f}, Ц4={v4:.0f} (общий счётчик: {vsum:.0f}). Пик ДМРВ: {peak_maf:.1f} кг/ч."
+          - default: true
+            status: status-ok
+            badge: "НОРМА"
+            val: "Пропусков: 0 | Пик {peak_maf:.0f} кг/ч"
+            tip: "Пропуски воспламенения по цилиндрам Ц1–Ц4 отсутствуют. Пиковый расход воздуха ДМРВ: {peak_maf:.1f} кг/ч при макс. оборотах {peak_rpm:.0f} об/мин."
+
+      # 3. Стабильность сигнала ДПКВ (отсутствие срывов оборотов в 0 на ходу)
+      - id: ckp_signal_stability
+        title: "Сигнал ДПКВ и срывы оборотов"
+        type: event_window
+        mode: valid
+        norm: "Срывов ДПКВ на ходу: 0"
+        focus_traces: ["RPM", "SPD", "IGN", "VBAT"]
+        focus_metric: drop_rpm
+        trigger:
+          transition: "RPM: >= 1100 -> == 0"
+          where: "SPD >= 5"
+          cooldown_sec: 1.0
+        window:
+          duration_sec: 0.8
+          metrics:
+            drop_rpm: "RPM_start"
+            recovered: "any(RPM >= 800)"
+        if_empty:
+          status: status-ok
+          badge: "НОРМА"
+          val: "Срывов ДПКВ: 0"
+          tip: "Мгновенных срывов сигнала датчика положения коленвала (провалов оборотов в 0 на ходу) не зафиксировано."
+        rules:
+          - when: "total_events >= 1"
+            status: status-bad
+            badge: "СБОЙ ДПКВ"
+            tags: ["ckp_dropout"]
+            val: "Срывов ДПКВ: {total_events} (с {max(drop_rpm):.0f} об/мин)"
+            tip: "Обнаружены мгновенные провалы оборотов в 0 при движении (событий: {total_events}, моменты: {times(drop_rpm > 0)}). Проверьте разъём и проводку ДПКВ, зазор и биение задающего диска."
+
+      # 4. Каскадный отклик на резкий газ: ДПДЗ -> ДМРВ -> Впрыск -> Обороты
+      - id: throttle_cascade_response
+        title: "Отклик на резкий газ"
+        type: event_window
+        mode: running
+        norm: "Цепочка ДПДЗ → ДМРВ → Впрыск → Обороты"
+        focus_traces: ["TPS", "MAF", "INJ", "RPM"]
+        focus_metric: rpm_dip
+        trigger:
+          transition: "TPS: <= 22 -> >= 24"
+          where: "RPM >= 650 and RPM <= 3800"
+          cooldown_sec: 2.0
+        window:
+          duration_sec: 1.3
+          metrics:
+            tps_jump: "TPS_end - TPS_start"
+            rpm_dip: "RPM_start - min(RPM)"
+            rpm_gain: "max(RPM) - RPM_start"
+            maf_gain: "max(MAF) - MAF_start"
+            inj_gain: "max(INJ) - INJ_start"
+            weak_maf: "(max(MAF) - MAF_start) < max_val(5.0, MAF_start * 0.20)"
+            weak_inj: "(max(INJ) - INJ_start) < max_val(0.8, INJ_start * 0.15)"
+        if_empty:
+          status: status-na
+          badge: "НЕТ ДАННЫХ"
+          val: "Нет резких нажатий"
+          tip: "В логе не зафиксировано резких открытий дроссельной заслонки с малых углов."
+        rules:
+          - when: "count(rpm_dip >= 75 or weak_maf or weak_inj) >= 2"
+            status: status-warn
+            badge: "ПРОВАЛ ПРИ ГАЗЕ"
+            tags: ["throttle_lag"]
+            val: "Сбоев отклика: {count(rpm_dip >= 75 or weak_maf or weak_inj)} из {total_events}"
+            tip: "При резком открытии дросселя зафиксированы провалы оборотов или задержка прироста ДМРВ/впрыска (моменты: {times(rpm_dip >= 75 or weak_maf or weak_inj)}, макс. провал -{max(rpm_dip):.0f} об/мин). Проверьте ДПДЗ, ДМРВ и давление топлива."
+          - default: true
+            status: status-ok
+            badge: "НОРМА"
+            val: "Чётко: {total_events - count(rpm_dip >= 75 or weak_maf or weak_inj)} из {total_events}"
+            tip: "Проанализировано резких открытий дросселя: {total_events}. Каскадный отклик ДПДЗ → ДМРВ → впрыск → обороты отрабатывает штатно."

@@ -1,4 +1,6 @@
-"""ECUScope — генератор интерактивного HTML-отчёта и диагностики логов ЭБУ."""
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""ECUScope — генератор интерактивного HTML-отчёта, промежуточного JSON и диагностики логов ЭБУ."""
 
 from __future__ import annotations
 
@@ -6,7 +8,7 @@ import argparse
 import html as html_lib
 import json
 import math
-import os
+import re
 import statistics
 import sys
 import webbrowser
@@ -15,8 +17,7 @@ from pathlib import Path
 import plotly.graph_objects as go
 import pyarrow as pa
 
-from diagnose_checks import run_extra_checks
-from diagnose_checks_base import run_base_checks
+from diagnose_checks import run_base_checks, run_extra_checks
 from diagnose_templates import (
     BASE_COLORS,
     CATEGORY_ORDER,
@@ -37,6 +38,19 @@ from diagnose_utils import (
     format_duration,
 )
 from parser import load_table, save_csv, save_parquet
+
+
+def _deduplicate_table(table: pa.Table) -> pa.Table:
+    """Удаляет дублирующиеся колонки из таблицы PyArrow с сохранением первого вхождения."""
+    seen: set[str] = set()
+    keep_indices: list[int] = []
+    for idx, name in enumerate(table.column_names):
+        if name not in seen:
+            seen.add(name)
+            keep_indices.append(idx)
+    if len(keep_indices) == table.num_columns:
+        return table
+    return table.select(keep_indices)
 
 
 def get_valid_indices(table: pa.Table) -> list[int]:
@@ -66,11 +80,148 @@ def get_valid_indices(table: pa.Table) -> list[int]:
     return valid
 
 
-def analyze_log(table: pa.Table) -> dict:
+_CARD_TRACES_RULES: list[tuple[tuple[str, ...], list[str]]] = [
+    (("перекрёстный", "сводн"), ["RPM", "MAF", "TPS", "FR", "IAC"]),
+    (("пуск", "прокрут"), ["RPM", "VBAT", "ECT", "ECT_START"]),
+    (("напряжен", "акб", "генератор"), ["VBAT", "RPM", "ECT", "TPS"]),
+    (("термостат", "вентилятор"), ["ECT", "FAN1", "SPD", "RPM"]),
+    (("дтож и дтв", "на старте"), ["ECT", "IAT", "RPM"]),
+    (("температура ож",), ["ECT", "IAT", "FAN1", "SPD"]),
+    (("дпдз", "отсечка пхх"), ["TPS", "ADC_TPS", "INJ", "DFCO_FLAG", "RPM"]),
+    (("рхх", "подсос"), ["IAC", "RPM", "RPM_DESIRED", "TPS"]),
+    (("дмрв", "расход воздуха"), ["MAF", "ADC_MAF", "TPS", "RPM"]),
+    (("резкий газ", "отклик"), ["TPS", "MAF", "INJ", "RPM"]),
+    (("детонац", "отскок уоз"), ["RPM", "IGN", "KNOCK_RETARD", "LOAD"]),
+    (("пропуск",), ["RPM", "MIS_CYL_1", "MIS_CYL_2", "MIS_CYL_3", "MIS_CYL_4", "CRANK_UNBAL"]),
+    (("дпкв", "динамика уоз"), ["RPM", "IGN", "SPD", "CRANK_UNBAL"]),
+    (("уоз",), ["IGN", "IAC", "RPM", "TPS"]),
+    (("провал", "обороты хх"), ["RPM", "RPM_DESIRED", "IAC", "TPS"]),
+    (("кислород", "дк1", "дк2"), ["O2_1", "O2_2", "FR", "O2_FB1", "RPM"]),
+    (("катализатор",), ["O2_2", "O2_1", "CAT_AMP_IDX", "RPM"]),
+    (("адсорбер", "кпа"), ["PURGE", "FR", "IAC", "RPM"]),
+    (("баланс смеси", "коррекц", "адаптац"), ["FR", "FRA", "RKAT", "MAF", "RPM"]),
+    (("форсунк", "топливоподач", "впрыск", "расход топлива"), ["INJ", "INJ_DUTY", "FR", "TPS", "RPM"]),
+    (("ошибк",), ["ERR", "MIL", "RPM"]),
+]
+
+
+def _extract_event_timestamps(text: str) -> list[float]:
+    """Извлекает отметки времени в секундах из текста/подсказки карточки (например '142.5с' или '142с (2:22)')."""
+    found: list[float] = []
+    for m in re.finditer(r"(?<![\d.,])(\d+(?:\.\d+)?)\s*с(?:\s*\(\d+:\d+\)|(?=[\s,.;:!?)\]]|$))", text):
+        try:
+            val = float(m.group(1))
+            if 0.0 <= val <= 86400.0:
+                found.append(val)
+        except ValueError:
+            continue
+    return found
+
+
+def _attach_card_focus(
+    checks: list[dict],
+    table: pa.Table,
+    valid_idx: list[int],
+    run_idx: list[int],
+    hot_idle_idx: list[int],
+) -> None:
+    """Добавляет каждой карточке поле focus (интервал времени и целевые датчики для графика Plotly)."""
+    if not valid_idx:
+        return
+
+    times_raw = col_vals(table, COL["TIME"])
+    t_valid = [float(times_raw[i]) for i in valid_idx if i < len(times_raw) and times_raw[i] is not None]
+    if not t_valid:
+        return
+
+    t_min, t_max = min(t_valid), max(t_valid)
+    t_span = max(1.0, t_max - t_min)
+
+    t_run = [float(times_raw[i]) for i in run_idx if i < len(times_raw) and times_raw[i] is not None]
+    t_idle = [float(times_raw[i]) for i in hot_idle_idx if i < len(times_raw) and times_raw[i] is not None]
+
+    avail_cols = set(table.column_names) - EXCLUDE_COLS
+
+    for card in checks:
+        title = str(card.get("title", ""))
+        title_low = title.lower()
+        combined_text = f"{card.get('val', '')}\n{card.get('tooltip', '')}"
+
+        # 1. Подбор целевых датчиков
+        col_keys = ["RPM", "MAF", "TPS", "ECT"]
+        for keywords, keys in _CARD_TRACES_RULES:
+            if any(kw in title_low for kw in keywords):
+                col_keys = keys
+                break
+
+        traces: list[str] = []
+        for k in col_keys:
+            cname = COL.get(k, k)
+            if cname in avail_cols and cname not in traces:
+                traces.append(cname)
+        if not traces:
+            traces = [c for c in DEFAULT_VISIBLE if c in avail_cols]
+
+        # 2. Определение временного интервала [start, end] и маркера события
+        ts_list = _extract_event_timestamps(combined_text)
+        event_t: float | None = None
+
+        if ts_list:
+            event_t = ts_list[0]
+            half_win = min(25.0, max(12.0, t_span * 0.08))
+            start_t = max(t_min, event_t - half_win)
+            end_t = min(t_max, event_t + half_win)
+        elif any(kw in title_low for kw in ("пуск", "на старте")):
+            t0 = t_valid[0]
+            start_t = t_min
+            end_t = min(t_max, t0 + min(45.0, max(15.0, t_span * 0.25)))
+            if t_run:
+                event_t = t_run[0]
+        elif any(kw in title_low for kw in ("хх", "подсос", "рхх")) and t_idle:
+            mid_t = t_idle[len(t_idle) // 2]
+            half_win = min(40.0, max(15.0, t_span * 0.15))
+            start_t = max(t_min, mid_t - half_win)
+            end_t = min(t_max, mid_t + half_win)
+        else:
+            start_t = t_min
+            end_t = t_max
+
+        if end_t - start_t < 2.0:
+            start_t = t_min
+            end_t = t_max
+
+        card["focus"] = {
+            "title": title,
+            "start": round(start_t, 3),
+            "end": round(end_t, 3),
+            "event_t": round(event_t, 3) if event_t is not None else None,
+            "traces": traces,
+        }
+
+
+def analyze_log(table: pa.Table, source_name: str = "") -> dict:
     """Выполняет полный расчёт метрик поездки и запускает все диагностические проверки."""
+    table = _deduplicate_table(table)
     valid_idx = get_valid_indices(table)
     if not valid_idx:
-        return {"valid_count": 0, "meta": [], "checks": []}
+        return {
+            "schema_version": "1.0",
+            "source": source_name,
+            "valid_count": 0,
+            "summary": {
+                "valid_frames": 0,
+                "total_frames": table.num_rows,
+                "total_sec": 0.0,
+                "run_sec": 0.0,
+                "idle_sec": 0.0,
+                "distance_km": 0.0,
+                "fuel_l": 0.0,
+                "avg_consumption_l_100km": None,
+            },
+            "meta": [],
+            "cards": [],
+            "checks": [],
+        }
 
     times_raw = col_vals(table, COL["TIME"])
     rpm_all = col_vals(table, COL["RPM"])
@@ -144,16 +295,45 @@ def analyze_log(table: pa.Table) -> dict:
     base_checks = run_base_checks(table, valid_idx, run_idx, hot_idle_idx)
     extra_checks = run_extra_checks(table, valid_idx, run_idx, hot_idle_idx, base_results=base_checks)
     checks = list(base_checks) + list(extra_checks)
+    _attach_card_focus(checks, table, valid_idx, run_idx, hot_idle_idx)
+
+    summary = {
+        "valid_frames": len(valid_idx),
+        "total_frames": table.num_rows,
+        "total_sec": round(total_sec, 3),
+        "run_sec": round(run_sec, 3),
+        "idle_sec": round(idle_sec, 3),
+        "distance_km": round(dist_km, 4),
+        "fuel_l": round(fuel_l, 4),
+        "avg_consumption_l_100km": round(avg_cons, 2) if avg_cons is not None else None,
+    }
 
     return {
+        "schema_version": "1.0",
+        "source": source_name,
         "valid_count": len(valid_idx),
+        "summary": summary,
         "meta": meta,
+        "cards": checks,
         "checks": checks,
     }
 
 
+def save_report_json(report: dict, json_path: str | os.PathLike) -> None:
+    """Сохраняет промежуточный отчёт диагностики в компактный JSON-файл."""
+    serializable = {
+        "schema_version": report.get("schema_version", "1.0"),
+        "source": report.get("source", ""),
+        "valid_count": report.get("valid_count", 0),
+        "summary": report.get("summary", {}),
+        "meta": [{"label": k, "value": v} for k, v in report.get("meta", [])],
+        "cards": report.get("cards", report.get("checks", [])),
+    }
+    Path(json_path).write_text(json.dumps(serializable, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def render_summary_html(report: dict) -> str:
-    """Формирует HTML-разметку верхней панели сводки и карточек проверок."""
+    """Формирует HTML-разметку верхней панели сводки и интерактивных карточек проверок."""
     meta_html = "".join(
         f'<span class="meta-badge">{html_lib.escape(k)}: <b>{html_lib.escape(v)}</b></span>'
         for k, v in report.get("meta", [])
@@ -182,8 +362,14 @@ def render_summary_html(report: dict) -> str:
         norm = html_lib.escape(c.get("norm", ""))
         tip = c.get("tooltip")
         tip_attr = f' title="{html_lib.escape(tip)}"' if tip else ""
+        focus = c.get("focus")
+        focus_attr = (
+            f" data-focus='{html_lib.escape(json.dumps(focus, ensure_ascii=False))}'"
+            if focus
+            else ""
+        )
         cards_html.append(
-            f'<div class="check-card {st}"{tip_attr}>'
+            f'<div class="check-card {st}"{tip_attr}{focus_attr}>'
             f'<div class="check-title"><span>{title}</span><span>{badge}</span></div>'
             f'<div class="check-val">{val}</div>'
             f'<div class="check-norm">{norm}</div>'
@@ -248,13 +434,16 @@ def build_interactive_html(
     html_path: str | os.PathLike,
     default_visible: list[str],
     title: str | None = None,
+    report: dict | None = None,
 ) -> None:
     """Генерирует автономный HTML-файл отчёта с панелью диагностики и графиком Plotly."""
+    table = _deduplicate_table(table)
     valid_idx = get_valid_indices(table)
     if not valid_idx:
         raise ValueError("В таблице отсутствуют валидные кадры для построения графика.")
 
-    report = analyze_log(table)
+    if report is None:
+        report = analyze_log(table)
     summary_html = render_summary_html(report)
 
     times_raw = col_vals(table, COL["TIME"])
@@ -373,7 +562,7 @@ def build_interactive_html(
                 f"</label>"
                 f'<div class="scale-box">'
                 f'<span class="scale-prefix">x</span>'
-                f'<input type="text" class="scale-input" data-idx="{idx}" value="{sc_str}" title="Множитель масштаба">'
+                f'<input type="text" class="scale-input" data-idx="{idx}" data-default-scale="{sc_str}" value="{sc_str}" title="Множитель масштаба">'
                 f"</div>"
                 f"</div>"
             )
@@ -409,6 +598,13 @@ def main() -> None:
     parser.add_argument("--parquet", help="Путь для сохранения Parquet (при чтении сырого лога)")
     parser.add_argument("--csv", help="Дополнительно экспортировать таблицу в CSV")
     parser.add_argument(
+        "--json",
+        nargs="?",
+        const="",
+        default=None,
+        help="Сохранить промежуточный отчёт диагностики в JSON (по умолчанию <имя>.report.json)",
+    )
+    parser.add_argument(
         "--pid-file",
         default="pids/bosch_m797.csv",
         help="Путь к CSV-файлу формул в формате Torque Pro (по умолчанию pids/bosch_m797.csv)",
@@ -428,6 +624,7 @@ def main() -> None:
         sys.exit(1)
 
     table, was_raw = load_table(in_path, pid_file=pid_path)
+    table = _deduplicate_table(table)
 
     if was_raw:
         pq_path = Path(args.parquet) if args.parquet else in_path.with_suffix(".parquet")
@@ -439,9 +636,16 @@ def main() -> None:
         save_csv(table, csv_path)
         print(f"Сохранено в CSV: {csv_path}")
 
+    report = analyze_log(table, source_name=str(in_path))
+
+    if args.json is not None:
+        json_path = Path(args.json) if args.json else in_path.with_suffix(".report.json")
+        save_report_json(report, json_path)
+        print(f"Сохранено в JSON: {json_path}")
+
     html_path = Path(args.html) if args.html else in_path.with_suffix(".html")
     try:
-        build_interactive_html(table, html_path, DEFAULT_VISIBLE, args.title)
+        build_interactive_html(table, html_path, DEFAULT_VISIBLE, args.title, report=report)
     except ValueError as exc:
         print(f"Пропуск ({args.input}): {exc}")
         return

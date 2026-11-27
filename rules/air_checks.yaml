@@ -1,0 +1,384 @@
+# ECUScope — Проверка воздушного тракта, дросселя, РХХ и переключений (Bosch M7.9.7 / M7.9.7+)
+# Чистый декларативный формат (без Python-кода в YAML)
+
+order: 30
+title: "Воздушный тракт, дроссель и холостой ход"
+
+checks:
+  - id: tps_and_dfco
+    title: "ДПДЗ и отсечка ПХХ"
+    type: compare_modes
+    norm: "Норма нуля: 0% | АЦП: 0.35–0.70 В"
+    require_all: false
+    min_samples: 1
+    inputs:
+      tps_min:
+        param: TPS
+        mode: valid
+        agg: min
+      tps_max:
+        param: TPS
+        mode: valid
+        agg: max
+      adc_med:
+        param: ADC_TPS
+        mode: valid
+        where: "TPS <= 0.5 and 0.05 <= ADC_TPS <= 4.95"
+        agg: median
+      closed_cnt:
+        param: TPS
+        mode: valid
+        where: "TPS <= 0.2"
+        agg: count
+      no_idle_cnt:
+        param: TPS
+        mode: valid
+        where: "TPS <= 0.2 and IDLE_FLAG < 0.5"
+        agg: count
+      coasting_cnt:
+        param: RPM
+        mode: running
+        where: "TPS <= 0.5 and RPM >= 1750 and SPD >= 15.0"
+        agg: count
+      dfco_cnt:
+        param: RPM
+        mode: running
+        where: "TPS <= 0.5 and RPM >= 1750 and SPD >= 15.0 and (DFCO_FLAG >= 0.5 or INJ <= 0.05)"
+        agg: count
+    compute:
+      n_closed: "closed_cnt or 0"
+      n_no_idle: "no_idle_cnt or 0"
+      n_coast: "coasting_cnt or 0"
+      n_dfco: "dfco_cnt or 0"
+      no_idle_ratio: "(n_no_idle / n_closed) if n_closed >= 20 else 0.0"
+      dfco_pct: "(n_dfco / n_coast * 100.0) if n_coast >= 8 else 100.0"
+      adc_bad: "adc_med is not None and (adc_med < 0.25 or adc_med > 0.85)"
+      adc_warn: "adc_med is not None and (adc_med < 0.35 or adc_med > 0.72)"
+    focus_traces: ["TPS", "RPM", "INJ", "SPD"]
+    rules:
+      - when: "tps_min is None"
+        status: na
+        badge: "НЕТ ДАННЫХ"
+        val: "Нет данных ДПДЗ"
+        norm: "Норма нуля: 0% | ПХХ: впрыск 0 мс"
+        tip: "В логе отсутствует канал положения дроссельной заслонки (ДПДЗ)."
+
+      - when: "tps_min > 1.0"
+        status: bad
+        badge: "ПРОБЛЕМА"
+        tags: ["tps_offset"]
+        val: "Мин. {tps_min:.1f}% [ДПДЗ не падает в 0% (мин. {tps_min:.1f}%)]"
+        tip: "Диапазон ДПДЗ: {tps_min:.1f}% .. {tps_max:.1f}%. Заслонка не закрывается до конца или сбит ноль датчика."
+
+      - when: "adc_bad"
+        status: bad
+        badge: "ПРОБЛЕМА"
+        tags: ["tps_offset"]
+        val: "Мин. {tps_min:.1f}% | АЦП {adc_med:.2f} В [АЦП ДПДЗ вне нормы ({adc_med:.2f} В)]"
+        tip: "Диапазон ДПДЗ: {tps_min:.1f}% .. {tps_max:.1f}%. АЦП закрытого ДПДЗ: {adc_med:.3f} В (эталон 0.35–0.70 В)."
+
+      - when: "tps_min > 0.2"
+        status: warn
+        badge: "ВНИМАНИЕ"
+        tags: ["tps_offset"]
+        val: "Мин. {tps_min:.1f}% [Сбит ноль ДПДЗ ({tps_min:.1f}%)]"
+        tip: "Диапазон ДПДЗ: {tps_min:.1f}% .. {tps_max:.1f}%. ЭБУ может не переходить в режим холостого хода."
+
+      - when: "adc_warn"
+        status: warn
+        badge: "ВНИМАНИЕ"
+        tags: ["tps_offset"]
+        val: "Мин. {tps_min:.1f}% | АЦП {adc_med:.2f} В [Сдвиг АЦП ДПДЗ ({adc_med:.2f} В)]"
+        tip: "Диапазон ДПДЗ: {tps_min:.1f}% .. {tps_max:.1f}%. АЦП закрытого ДПДЗ: {adc_med:.3f} В (эталон 0.35–0.70 В)."
+
+      - when: "no_idle_ratio > 0.35"
+        status: warn
+        badge: "ВНИМАНИЕ"
+        tags: ["tps_offset"]
+        val: "Мин. {tps_min:.1f}% [ЭБУ не видит признак ХХ при ДПДЗ=0%]"
+        tip: "При отпущенной педали газа флаг холостого хода отсутствует в {no_idle_ratio * 100:.0f}% кадров."
+
+      - when: "n_coast >= 8 and dfco_pct < 20.0"
+        status: warn
+        badge: "ВНИМАНИЕ"
+        tags: ["no_dfco"]
+        val: "Мин. {tps_min:.1f}% [Не включается отсечка ПХХ]"
+        tip: "Торможение двигателем (>1750 об/мин): {n_coast:.0f} кадров, отсечка ПХХ сработала только в {dfco_pct:.0f}%."
+
+      - when: "adc_med is not None and n_coast >= 8"
+        status: ok
+        badge: "НОРМА"
+        val: "Мин. {tps_min:.1f}% | АЦП {adc_med:.2f} В | ПХХ {dfco_pct:.0f}%"
+        tip: "Диапазон ДПДЗ: {tps_min:.1f}% .. {tps_max:.1f}%. АЦП покоя: {adc_med:.3f} В. Отсечка ПХХ работает штатно ({dfco_pct:.0f}%)."
+
+      - default:
+        status: ok
+        badge: "НОРМА"
+        val: "Мин. {tps_min:.1f}%"
+        tip: "Диапазон ДПДЗ: {tps_min:.1f}% .. {tps_max:.1f}%. Положение нуля дросселя в норме."
+
+  - id: iac_and_air_leak
+    title: "РХХ и подсос воздуха"
+    type: compare_modes
+    norm: "Норма РХХ: 25–48 шаг | Цель: ±40 об/мин"
+    require_all: false
+    min_samples: 10
+    inputs:
+      iac_med:
+        param: IAC
+        mode: hot_idle
+        agg: median
+        min_samples: 10
+      rpm_med:
+        param: RPM
+        mode: hot_idle
+        agg: median
+        min_samples: 10
+      rpm_des_med:
+        param: RPM_DESIRED
+        mode: hot_idle
+        agg: median
+        min_samples: 5
+      rpm_spread:
+        param: RPM
+        mode: hot_idle
+        agg: spread
+        min_samples: 15
+      dip_cnt:
+        param: RPM
+        mode: valid
+        where: "ECT >= 70.0 and TPS <= 0.5 and SPD <= 3.0 and 450.0 <= RPM <= 695.0"
+        agg: count
+        min_samples: 0
+    compute:
+      rpm_diff: "(rpm_med - rpm_des_med) if (rpm_med is not None and rpm_des_med is not None) else 0.0"
+      n_dips: "dip_cnt or 0"
+    focus_traces: ["IAC", "RPM", "RPM_DESIRED", "TPS"]
+    rules:
+      - when: "iac_med is None or rpm_med is None"
+        status: na
+        badge: "НЕТ ДАННЫХ"
+        val: "Мало прогретого ХХ"
+        norm: "Норма РХХ на ХХ: 25–48 шагов"
+        tip: "Для анализа РХХ и стабильности ХХ нужен прогретый двигатель (>= 75 °C) на холостом ходу."
+
+      - when: "iac_med >= 52.0 and rpm_des_med is not None and rpm_diff <= -45.0"
+        status: bad
+        badge: "ПРОБЛЕМА"
+        tags: ["iac_fault"]
+        val: "РХХ {iac_med:.0f} шаг | ХХ {rpm_med:.0f} об/мин [ЗАКЛИНИЛ РХХ? ({iac_med:.0f} шаг, об. {rpm_diff:+.0f})]"
+        tip: "Медиана РХХ на прогретом ХХ: {iac_med:.0f} шаг, обороты {rpm_med:.0f} против цели {rpm_des_med:.0f} об/мин. ЭБУ открывает РХХ, но обороты ниже заданных — проверьте шток РХХ и канал ХХ."
+
+      - when: "iac_med <= 18.0"
+        status: bad
+        badge: "ПРОБЛЕМА"
+        tags: ["air_leak"]
+        val: "РХХ {iac_med:.0f} шаг | ХХ {rpm_med:.0f} об/мин [ПОДСОС ВОЗДУХА (РХХ {iac_med:.0f} шаг)]"
+        tip: "Медиана РХХ на прогретом ХХ: {iac_med:.0f} шаг (норма 25–48). РХХ зажат ниже 19 шагов — двигатель сосёт воздух мимо дросселя."
+
+      - when: "iac_med >= 58.0"
+        status: bad
+        badge: "ПРОБЛЕМА"
+        tags: ["iac_fault"]
+        val: "РХХ {iac_med:.0f} шаг | ХХ {rpm_med:.0f} об/мин [Забит дроссель/РХХ ({iac_med:.0f} шаг)]"
+        tip: "Медиана РХХ на прогретом ХХ: {iac_med:.0f} шаг — сильное загрязнение перепускного канала ХХ или дроссельной заслонки."
+
+      - when: "rpm_des_med is not None and abs(rpm_diff) >= 75.0"
+        status: bad
+        badge: "ПРОБЛЕМА"
+        tags: ["iac_fault"]
+        val: "РХХ {iac_med:.0f} шаг | ХХ {rpm_med:.0f} об/мин [Сбой оборотов ХХ ({rpm_diff:+.0f} от цели)]"
+        tip: "Фактические обороты ХХ {rpm_med:.0f} об/мин существенно отличаются от заданных {rpm_des_med:.0f} об/мин."
+
+      - when: "iac_med <= 23.0"
+        status: warn
+        badge: "ВНИМАНИЕ"
+        tags: ["air_leak"]
+        val: "РХХ {iac_med:.0f} шаг | ХХ {rpm_med:.0f} об/мин [Возможен подсос (РХХ {iac_med:.0f} шаг)]"
+        tip: "Медиана РХХ на прогретом ХХ: {iac_med:.0f} шаг (норма 25–48) — положение на нижней границе допуска."
+
+      - when: "iac_med >= 50.0"
+        status: warn
+        badge: "ВНИМАНИЕ"
+        tags: ["iac_fault"]
+        val: "РХХ {iac_med:.0f} шаг | ХХ {rpm_med:.0f} об/мин [Повышен шаг РХХ ({iac_med:.0f} шаг)]"
+        tip: "Медиана РХХ на прогретом ХХ: {iac_med:.0f} шаг (норма 25–48) — желательна очистка дроссельного узла и канала РХХ."
+
+      - when: "rpm_des_med is not None and abs(rpm_diff) >= 45.0"
+        status: warn
+        badge: "ВНИМАНИЕ"
+        tags: ["iac_fault"]
+        val: "РХХ {iac_med:.0f} шаг | ХХ {rpm_med:.0f} об/мин [Отклонение ХХ ({rpm_diff:+.0f} от цели)]"
+        tip: "Обороты ХХ: факт {rpm_med:.0f} vs цель {rpm_des_med:.0f} об/мин."
+
+      - when: "n_dips >= 3"
+        status: warn
+        badge: "ВНИМАНИЕ"
+        tags: ["iac_fault", "rpm_dip"]
+        val: "РХХ {iac_med:.0f} шаг | ХХ {rpm_med:.0f} об/мин [Слабый подхват РХХ ({n_dips:.0f} кадр.)]"
+        tip: "Зафиксированы провалы оборотов ниже 695 об/мин на прогретом моторе при отпущенной педали газа."
+
+      - default:
+        status: ok
+        badge: "НОРМА"
+        val: "РХХ {iac_med:.0f} шаг | ХХ {rpm_med:.0f} об/мин"
+        tip: "Медиана РХХ на прогретом ХХ: {iac_med:.0f} шаг (норма 25–48). Обороты холостого хода стабильны."
+
+  - id: maf_throttle_response
+    title: "Отклик ДМРВ и АЦП"
+    type: compare_modes
+    norm: "АЦП покоя: 0.996–1.020 В"
+    require_all: false
+    min_samples: 1
+    inputs:
+      adc_rest:
+        param: ADC_MAF
+        mode: valid
+        where: "RPM == 0 and 0.80 <= ADC_MAF <= 1.35"
+        agg: median
+      adc_rest_cnt:
+        param: ADC_MAF
+        mode: valid
+        where: "RPM == 0 and 0.80 <= ADC_MAF <= 1.35"
+        agg: count
+        min_samples: 0
+      maf_open_med:
+        param: MAF
+        mode: running
+        where: "TPS >= 22.0 and RPM >= 1800.0"
+        agg: median
+      maf_open_max:
+        param: MAF
+        mode: running
+        where: "TPS >= 22.0 and RPM >= 1800.0"
+        agg: max
+      open_cnt:
+        param: MAF
+        mode: running
+        where: "TPS >= 22.0 and RPM >= 1800.0"
+        agg: count
+        min_samples: 0
+      sluggish_cnt:
+        param: MAF
+        mode: running
+        where: "TPS >= 25.0 and RPM >= 2000.0 and MAF < 34.0"
+        agg: count
+        min_samples: 0
+    compute:
+      n_rest: "adc_rest_cnt or 0"
+      n_open: "open_cnt or 0"
+      n_slug: "sluggish_cnt or 0"
+      slug_ratio: "(n_slug / n_open) if n_open >= 6 else 0.0"
+    focus_traces: ["MAF", "TPS", "RPM"]
+    rules:
+      - when: "adc_rest is None and maf_open_med is None"
+        status: na
+        badge: "НЕТ ДАННЫХ"
+        val: "Нет кадров покоя / газа"
+        tip: "Для проверки АЦП ДМРВ нужны кадры с включённым зажиганием до пуска (0 об/мин), а для отклика — открытие дросселя >= 22%."
+
+      - when: "adc_rest is not None and adc_rest >= 1.060"
+        status: bad
+        badge: "ПРОБЛЕМА"
+        tags: ["maf_issue"]
+        val: "АЦП {adc_rest:.3f} В [ИЗНОС ДМРВ (АЦП {adc_rest:.3f} В)]"
+        tip: "АЦП ДМРВ в покое ({n_rest:.0f} кадров): {adc_rest:.3f} В (новый Bosch HFM5: 0.996–1.015 В). Сильный дрейф нуля датчика."
+
+      - when: "slug_ratio > 0.35"
+        status: bad
+        badge: "ПРОБЛЕМА"
+        tags: ["maf_issue"]
+        val: "Газ {maf_open_med:.0f} кг/ч [Слабый рост ДМРВ при газе]"
+        tip: "При дросселе >= 22% ({n_open:.0f} кадров): медиана {maf_open_med:.1f} кг/ч, пик {maf_open_max:.1f} кг/ч. Расходомер занижает воздух под нагрузкой."
+
+      - when: "adc_rest is not None and adc_rest >= 1.035"
+        status: warn
+        badge: "ВНИМАНИЕ"
+        tags: ["maf_issue"]
+        val: "АЦП {adc_rest:.3f} В [Уставший ДМРВ (АЦП {adc_rest:.3f} В)]"
+        tip: "АЦП ДМРВ в покое ({n_rest:.0f} кадров): {adc_rest:.3f} В (новый Bosch HFM5: 0.996–1.015 В)."
+
+      - when: "adc_rest is not None and adc_rest < 0.960"
+        status: warn
+        badge: "ВНИМАНИЕ"
+        tags: ["maf_issue"]
+        val: "АЦП {adc_rest:.3f} В [Занижен АЦП ДМРВ ({adc_rest:.3f} В)]"
+        tip: "АЦП ДМРВ в покое: {adc_rest:.3f} В — проверьте опорное питание +5 В и массу датчика."
+
+      - when: "n_slug >= 3"
+        status: warn
+        badge: "ВНИМАНИЕ"
+        tags: ["maf_issue"]
+        val: "Газ {maf_open_med:.0f} кг/ч [Пониженный расход при газе]"
+        tip: "При дросселе >= 22%: медиана {maf_open_med:.1f} кг/ч, пик {maf_open_max:.1f} кг/ч."
+
+      - when: "adc_rest is not None and maf_open_med is not None"
+        status: ok
+        badge: "НОРМА"
+        val: "АЦП {adc_rest:.3f} В | газ {maf_open_med:.0f} кг/ч"
+        tip: "АЦП ДМРВ в покое: {adc_rest:.3f} В. При открытии дросселя >= 22%: медиана {maf_open_med:.1f} кг/ч, пик {maf_open_max:.1f} кг/ч."
+
+      - when: "adc_rest is not None"
+        status: ok
+        badge: "НОРМА"
+        val: "АЦП {adc_rest:.3f} В"
+        tip: "АЦП ДМРВ в покое ({n_rest:.0f} кадров): {adc_rest:.3f} В (новый Bosch HFM5: 0.996–1.015 В)."
+
+      - default:
+        status: ok
+        badge: "НОРМА"
+        val: "Газ {maf_open_med:.0f} кг/ч"
+        tip: "При открытии дросселя >= 22% ({n_open:.0f} кадров): медиана {maf_open_med:.1f} кг/ч, пик {maf_open_max:.1f} кг/ч."
+
+  - id: shift_flare_and_iac_hang
+    title: "Сброс газа и переключения"
+    type: event_window
+    mode: running
+    norm: "Без подброса оборотов (< +80 об/мин); сброс РХХ и ПХХ"
+    focus_traces: ["RPM", "TPS", "IAC", "INJ"]
+    focus_metric: flare_rpm
+    trigger:
+      where: "ECT >= 55.0 and SPD >= 10.0 and RPM >= 1650.0"
+      transition: "TPS: >= 12.0 -> <= 0.5"
+      cooldown_sec: 2.2
+    window:
+      duration_sec: 1.4
+      until: "TPS > 1.5"
+      min_frames: 2
+      metrics:
+        flare_rpm: "max(RPM) - RPM_start"
+        max_iac: "max(IAC)"
+        med_inj: "median(INJ)"
+        dfco_ok: "any(DFCO_FLAG >= 0.5 or INJ <= 0.05)"
+        hang_flag: "(max(IAC) >= 85.0 and RPM_start >= 1900.0 and not any(DFCO_FLAG >= 0.5 or INJ <= 0.05) and median(INJ) >= 1.2)"
+    if_empty:
+      val: "Нет сбросов в движении"
+      status: na
+      tip: "В логе не зафиксировано резких сбросов газа с >= 12% до 0% на скорости >= 10 км/ч."
+    rules:
+      - when: "count(flare_rpm >= 80) >= 2 or max(flare_rpm) >= 140"
+        status: bad
+        badge: "ПОДБРОС ОБОРОТОВ"
+        tags: ["shift_flare", "iac_fault"]
+        val: "Подбросов: {count(flare_rpm >= 80)} (до +{max(flare_rpm):.0f} об/мин)"
+        tip: "При закрытии дросселя в движении ({times(flare_rpm >= 80)}) обороты подскакивают до +{max(flare_rpm):.0f} об/мин, РХХ удерживается до {max(max_iac):.0f} шаг, впрыск {max(med_inj):.2f} мс. Проверьте концевик педали сцепления, демпфер РХХ в прошивке и лёгкость хода штока РХХ."
+
+      - when: "count(flare_rpm >= 80) == 1"
+        status: warn
+        badge: "ЗАВИСАНИЕ ХХ"
+        tags: ["shift_flare", "iac_fault"]
+        val: "Подброс +{max(flare_rpm):.0f} об/мин | РХХ {max(max_iac):.0f} шаг"
+        tip: "Зафиксирован подброс оборотов на {times(flare_rpm >= 80)} при сбросе газа в движении (РХХ до {max(max_iac):.0f} шаг). Проверьте концевик сцепления и калибровку ПХХ."
+
+      - when: "count(hang_flag) >= 2"
+        status: warn
+        badge: "ЗАВИСАНИЕ ХХ"
+        tags: ["iac_fault", "no_dfco"]
+        val: "Подвисаний РХХ: {count(hang_flag)} (до {max(max_iac):.0f} шаг, без ПХХ)"
+        tip: "На участках сброса газа ({times(hang_flag)}) ЭБУ удерживает РХХ ≥ 85 шагов с подачей топлива ({max(med_inj):.2f} мс) без включения отсечки ПХХ."
+
+      - default:
+        status: ok
+        badge: "НОРМА"
+        val: "Сбросов в движении: {total_events} (чётко)"
+        tip: "Проанализировано сбросов газа в движении: {total_events}. Обороты и шаг РХХ после закрытия дросселя снижаются плавно без подбросов."

@@ -55,7 +55,7 @@ COLUMNS = [
     "Напряж. с АЦП датчика полож. дроссельной заслонки (В)",
     "Напряж. с АЦП датчика кислорода до нейтрализатора (В)",
     "Напряжение с АЦП датчика температуры воздуха во впускном коллекторе (В)",
-    "Напряжение с АЦП датчика кислорода после нейтрализатора (В)",
+    "Напряж. с АЦП датчика кислорода после нейтрализатора (В)",
     "Сопротивление датчика кислорода до нейтрализатора (Ом)",
     "Напряжение с АЦП датчика ускорения (g)", "Напряжение на клапан рециркуляции (В)",
     "Сопротивление датчика кислорода после нейтрализатора (Ом)"
@@ -154,7 +154,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>ECUScope — Здоровье мотора</title>
+<title>__TITLE__</title>
 <style>
   * { box-sizing: border-box; }
   body {
@@ -334,6 +334,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     border-radius: 6px;
     padding: 6px 10px;
     font-size: 11.5px;
+    transition: transform 0.12s, box-shadow 0.12s, border-color 0.12s;
+  }
+  .check-card[data-focus] { cursor: pointer; }
+  .check-card[data-focus]:hover {
+    background: #1c222b;
+    border-color: #58a6ff;
+    transform: translateY(-1px);
+  }
+  .check-card.active {
+    background: #13233a;
+    border-color: #58a6ff;
+    box-shadow: 0 0 0 1px #58a6ff;
   }
   .check-card.status-ok { border-left-color: #00e676; }
   .check-card.status-warn { border-left-color: #ffab00; }
@@ -370,6 +382,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     flex-wrap: wrap;
   }
   .nav-label { font-size: 12px; color: #8b949e; margin-right: 4px; }
+  .focus-pill {
+    display: none;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 9px;
+    font-size: 12px;
+    border-radius: 5px;
+    background: #13233a;
+    border: 1px solid #1f6feb;
+    color: #79c0ff;
+    margin-left: auto;
+  }
+  .focus-pill.visible { display: inline-flex; }
+  .focus-pill button {
+    padding: 1px 6px;
+    font-size: 11px;
+    border-color: #1f6feb;
+    background: #0d1117;
+    color: #79c0ff;
+  }
   #chart-wrap { flex: 1; min-height: 0; width: 100%; }
   #chart { width: 100%; height: 100%; }
 </style>
@@ -401,6 +433,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <button type="button" id="nav-zoom-out">➖ Отдалить</button>
       <button type="button" id="nav-reset">⟲ Весь график</button>
       <button type="button" id="btn-normalize-top" class="btn-accent" title="Растянуть каждый включённый график на 0..100% по текущему видимому участку времени">📊 Авто-scale 0–100% (видимое)</button>
+      <span id="focus-pill" class="focus-pill">
+        <span id="focus-pill-text"></span>
+        <button type="button" id="btn-clear-focus" title="Сбросить выделение карточки и метку на графике">✕</button>
+      </span>
     </div>
     <div id="chart-wrap">
       __PLOT_DIV__
@@ -485,7 +521,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       let minV = Infinity;
       let maxV = -Infinity;
 
-      // Ищем min и max только в пределах текущего видимого окна [x0, x1]
       for (let i = 0; i < rawY.length; i++) {
         if (xArr) {
           const tx = Number(xArr[i]);
@@ -498,7 +533,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
       }
 
-      // Запасной вариант, если окно слишком узкое и в него не попал ни один кадр
       if (!isFinite(minV) || !isFinite(maxV)) {
         for (let i = 0; i < rawY.length; i++) {
           const v = rawY[i];
@@ -543,6 +577,99 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   document.getElementById("btn-normalize-side").addEventListener("click", normalizeVisibleTraces);
   document.getElementById("btn-normalize-top").addEventListener("click", normalizeVisibleTraces);
+
+  // --- Интерактивный переход из диагностических карточек на график ---
+  const focusPill = document.getElementById("focus-pill");
+  const focusPillText = document.getElementById("focus-pill-text");
+  const clearFocusBtn = document.getElementById("btn-clear-focus");
+  const checkCards = document.querySelectorAll(".check-card[data-focus]");
+
+  function clearCardFocus() {
+    checkCards.forEach(c => c.classList.remove("active"));
+    if (focusPill) focusPill.classList.remove("visible");
+    if (window.Plotly && chartEl) {
+      Plotly.relayout(chartEl, { shapes: [] });
+    }
+  }
+
+  if (clearFocusBtn) {
+    clearFocusBtn.addEventListener("click", clearCardFocus);
+  }
+
+  checkCards.forEach(card => {
+    card.addEventListener("click", () => {
+      let focus = null;
+      try {
+        focus = JSON.parse(card.dataset.focus || "null");
+      } catch (e) {
+        return;
+      }
+      if (!focus) return;
+
+      checkCards.forEach(c => c.classList.remove("active"));
+      card.classList.add("active");
+
+      const titleEl = card.querySelector(".check-title span");
+      const cardTitle = titleEl ? titleEl.textContent.trim() : "Событие";
+
+      if (Array.isArray(focus.traces) && focus.traces.length > 0) {
+        const wanted = new Set(focus.traces);
+        const indices = [];
+        const visList = [];
+        let matchedCount = 0;
+
+        checkboxes.forEach(cb => {
+          const idx = parseInt(cb.dataset.idx, 10);
+          const show = wanted.has(baseNames[idx]);
+          if (show) matchedCount++;
+          indices.push(idx);
+          visList.push(show);
+        });
+
+        if (matchedCount > 0) {
+          checkboxes.forEach((cb, pos) => { cb.checked = visList[pos]; });
+          Plotly.restyle(chartEl, { visible: visList }, indices);
+        }
+      }
+
+      const relayoutPatch = {};
+      const shapes = [];
+
+      if (isFinite(focus.start_sec) && isFinite(focus.end_sec) && focus.end_sec > focus.start_sec) {
+        const x0 = Math.max(minTime, Number(focus.start_sec));
+        const x1 = Math.min(maxTime, Number(focus.end_sec));
+        relayoutPatch["xaxis.range"] = [x0, x1];
+        relayoutPatch["xaxis.autorange"] = false;
+      } else {
+        relayoutPatch["xaxis.autorange"] = true;
+      }
+
+      if (isFinite(focus.marker_sec)) {
+        const mx = Math.max(minTime, Math.min(maxTime, Number(focus.marker_sec)));
+        shapes.push({
+          type: "line",
+          xref: "x",
+          yref: "paper",
+          x0: mx,
+          x1: mx,
+          y0: 0,
+          y1: 1,
+          line: { color: "#ff4d4d", width: 2, dash: "dash" }
+        });
+      }
+      relayoutPatch["shapes"] = shapes;
+
+      Plotly.relayout(chartEl, relayoutPatch).then(() => {
+        normalizeVisibleTraces();
+      });
+
+      if (focusPill && focusPillText) {
+        const timeTag = isFinite(focus.marker_sec) ? ` (${Number(focus.marker_sec).toFixed(1)} с)` : "";
+        focusPillText.textContent = `🎯 ${cardTitle}${timeTag}`;
+        focusPill.classList.add("visible");
+      }
+    });
+  });
 
   document.getElementById("search").addEventListener("input", (e) => {
     const q = e.target.value.trim().toLowerCase();
@@ -592,6 +719,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   });
 
   document.getElementById("btn-default").addEventListener("click", () => {
+    clearCardFocus();
     const visList = [];
     const indices = [];
     const newY = [];
@@ -657,6 +785,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   document.getElementById("nav-zoom-in").addEventListener("click", () => zoomX(0.5));
   document.getElementById("nav-zoom-out").addEventListener("click", () => zoomX(2.0));
   document.getElementById("nav-reset").addEventListener("click", () => {
+    clearCardFocus();
     Plotly.relayout(chartEl, { "xaxis.autorange": true, "yaxis.autorange": true });
   });
 </script>

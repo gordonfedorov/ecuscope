@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Тестовый прогон модулей ECUScope и логов из папки logs/
+# Тестовый прогон модулей ECUScope, YAML-правил и логов из папки logs/
 
 set -uo pipefail
 
@@ -39,19 +39,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "=== 1. Проверка импортов модулей ECUScope ==="
+echo "=== 1. Проверка импортов модулей ECUScope и YAML-правил ==="
 python3 - <<'PY'
 import sys
+from pathlib import Path
 
 modules = [
     "diagnose_utils",
     "parser",
     "diagnose_templates",
-    "diagnose_checks_base",
-    "diagnose_checks_thermal",
-    "diagnose_checks_air",
-    "diagnose_checks_fuel",
-    "diagnose_checks_engine",
+    "yaml_rules_engine",
     "diagnose_checks",
     "diagnose",
 ]
@@ -65,12 +62,20 @@ for m in modules:
         print(f"  [FAIL] {m}: {exc}")
         failed = True
 
+rules_dir = Path("rules")
+yaml_files = sorted(rules_dir.glob("*.yaml")) if rules_dir.exists() else []
+if not yaml_files:
+    print("  [FAIL] rules/*.yaml: не найдены файлы диагностических правил")
+    failed = True
+else:
+    print(f"  [OK]   rules/*.yaml ({len(yaml_files)} шт.: {', '.join(f.name for f in yaml_files)})")
+
 if failed:
     sys.exit(1)
 PY
 
 if [[ $? -ne 0 ]]; then
-    echo "ОШИБКА: Сбой при проверке импортов. Прогон логов остановлен."
+    echo "ОШИБКА: Сбой при проверке импортов или правил. Прогон логов остановлен."
     exit 1
 fi
 

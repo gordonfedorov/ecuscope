@@ -1,0 +1,205 @@
+# rules/thermal_checks.yaml — декларативные проверки системы охлаждения,
+# пусковых температур и электропитания для ECUScope (Bosch M7.9.7 / M7.9.7+).
+
+section: thermal
+order: 20
+title: "Система охлаждения и электропитание"
+
+checks:
+  - id: thermostat_and_fan
+    title: "Термостат и вентилятор"
+    type: threshold
+    mode: running
+    param: ECT
+    min_samples: 1
+    norm: "Термостат ≥ 80 °C | Вентилятор ~99–103 °C"
+    focus_traces: ["ECT", "FAN1", "SPD"]
+    metrics:
+      ect_min: "min('ECT', 'valid')"
+      ect_max: "max('ECT', 'valid')"
+      ect_run_max: "max('ECT', 'running')"
+      fan_on_cnt: "max('FAN1', 'valid')"
+    if_empty:
+      val: "Нет данных"
+      status: status-na
+      tip: "В логе отсутствует канал температуры охлаждающей жидкости."
+    rules:
+      - when: "ect_max >= 108.0"
+        status: bad
+        badge: "ПЕРЕГРЕВ"
+        tags: ["overheat"]
+        val: "{ect_min:.0f}..{ect_max:.0f} °C [ПЕРЕГРЕВ]"
+        tip: "Критическая температура ОЖ {ect_max:.1f} °C — риск перегрева двигателя."
+
+      - when: "ect_max < 78.0"
+        status: warn
+        badge: "НЕДОГРЕВ"
+        tags: ["thermostat_open"]
+        val: "{ect_min:.0f}..{ect_max:.0f} °C [НЕДОГРЕВ]"
+        tip: "Диапазон ДТОЖ за поездку: {ect_min:.1f}..{ect_max:.1f} °C. Мотор не вышел на рабочую температуру ≥ 80 °C — проверьте термостат."
+
+      - when: "ect_max >= 104.5"
+        status: warn
+        badge: "ВЫСОКАЯ"
+        tags: ["high_ect"]
+        val: "{ect_min:.0f}..{ect_max:.0f} °C"
+        tip: "Диапазон ДТОЖ за поездку: {ect_min:.1f}..{ect_max:.1f} °C. Температура близка к верхней границе нормы."
+
+      - default:
+        status: ok
+        badge: "НОРМА"
+        val: "{ect_min:.0f}..{ect_max:.0f} °C"
+        tip: "Диапазон ДТОЖ за поездку: {ect_min:.1f}..{ect_max:.1f} °C. Прогрев и тепловой режим в норме."
+
+  - id: cold_start_temps
+    title: "ДТОЖ и ДТВ на старте"
+    type: compare_modes
+    require_all: true
+    focus_traces: ["ECT", "IAT", "RPM"]
+    inputs:
+      ect0:
+        param: ECT
+        mode: valid
+        where: "RPM < 100"
+        agg: median
+        min_samples: 1
+      iat0:
+        param: IAT
+        mode: valid
+        where: "RPM < 100"
+        agg: median
+        min_samples: 1
+    compute:
+      diff: "abs(iat0 - ect0)"
+      iat_over_ect: "iat0 - ect0"
+    if_empty:
+      val: "Нет данных"
+      norm: "Норма расхождения на холодную ≤ 6 °C"
+      status: status-na
+      tip: "Отсутствуют показания ДТОЖ или ДТВ до пуска двигателя (0 об/мин)."
+    rules:
+      - when: "ect0 <= 35.0 and diff > 11.0"
+        status: bad
+        badge: "РАСХОЖДЕНИЕ"
+        tags: ["temp_sensor_drift"]
+        norm: "ДТОЖ {ect0:.0f}°C / ДТВ {iat0:.0f}°C (норма Δ ≤ 6°C)"
+        val: "РАСХОЖДЕНИЕ {diff:.0f} °C"
+        tip: "Холодный старт: ДТОЖ {ect0:.1f} °C, ДТВ {iat0:.1f} °C (разница {diff:.1f} °C) — один из датчиков врёт, возможны проблемы с пусковой смесью."
+
+      - when: "ect0 <= 35.0 and diff > 6.0"
+        status: warn
+        badge: "СДВИГ"
+        tags: ["temp_sensor_drift"]
+        norm: "ДТОЖ {ect0:.0f}°C / ДТВ {iat0:.0f}°C (норма Δ ≤ 6°C)"
+        val: "СДВИГ Δ {diff:.1f} °C"
+        tip: "Холодный старт: ДТОЖ {ect0:.1f} °C, ДТВ {iat0:.1f} °C (разница {diff:.1f} °C) — небольшой дрейф одного из температурных датчиков."
+
+      - when: "ect0 <= 35.0"
+        status: ok
+        badge: "НОРМА"
+        norm: "ДТОЖ {ect0:.0f}°C / ДТВ {iat0:.0f}°C (норма Δ ≤ 6°C)"
+        val: "Δ {diff:.1f} °C (НОРМА)"
+        tip: "Холодный старт: ДТОЖ {ect0:.1f} °C, ДТВ {iat0:.1f} °C — датчики согласованы."
+
+      - when: "iat0 > 75.0 or iat_over_ect > 25.0"
+        status: warn
+        badge: "ЖАР ВПУСК"
+        tags: ["heat_soak"]
+        norm: "ДТОЖ {ect0:.0f}°C / ДТВ {iat0:.0f}°C (горячий старт)"
+        val: "ДТВ {iat0:.0f} °C [ЖАР ВПУСК]"
+        tip: "Горячий старт: ДТОЖ {ect0:.1f} °C, ДТВ {iat0:.1f} °C — сильный прогрев впускного тракта."
+
+      - default:
+        status: ok
+        badge: "НОРМА"
+        norm: "ДТОЖ {ect0:.0f}°C / ДТВ {iat0:.0f}°C (горячий старт)"
+        val: "{ect0:.0f} / {iat0:.0f} °C"
+        tip: "Тёплый/горячий пуск: ДТОЖ {ect0:.1f} °C, ДТВ {iat0:.1f} °C."
+
+  - id: battery_and_alternator
+    title: "АКБ и генератор"
+    type: threshold
+    mode: running
+    param: VBAT
+    min_samples: 1
+    focus_traces: ["VBAT", "RPM", "ECT", "TPS"]
+    metrics:
+      v_med: "median('VBAT', 'running')"
+      v_min: "min('VBAT', 'running')"
+      v_max: "max('VBAT', 'running')"
+    if_empty:
+      val: "Нет данных"
+      norm: "АКБ ≥ 12.2 В | Зарядка 13.6–14.6 В"
+      status: status-na
+      tip: "Канал напряжения питания ЭБУ пуст."
+    rules:
+      - when: "v_med < 13.1 or v_max > 15.1"
+        status: bad
+        badge: "СБОЙ ЗАРЯДКИ"
+        tags: ["charging_fault", "low_voltage"]
+        norm: "Зарядка 13.6–14.6 В | Мин {v_min:.2f}В"
+        val: "{v_med:.2f} В [СБОЙ ЗАРЯДКИ]"
+        tip: "Напряжение при работе ДВС: медиана {v_med:.2f} В (диапазон {v_min:.2f}..{v_max:.2f} В). Критическое отклонение зарядки — проверьте генератор и регулятор напряжения."
+
+      - when: "v_med < 13.5 or v_min < 12.7"
+        status: warn
+        badge: "ПРОСАДКА U"
+        tags: ["low_voltage"]
+        norm: "Зарядка 13.6–14.6 В | Мин {v_min:.2f}В"
+        val: "{v_med:.2f} В [ПРОСАДКА U]"
+        tip: "Напряжение при работе ДВС: медиана {v_med:.2f} В (диапазон {v_min:.2f}..{v_max:.2f} В). Просадка напряжения под нагрузкой — проверьте ремень, щётки генератора и силовые массы."
+
+      - default:
+        status: ok
+        badge: "НОРМА"
+        norm: "Зарядка 13.6–14.6 В | Мин {v_min:.2f}В"
+        val: "{v_med:.2f} В"
+        tip: "Напряжение при работе ДВС: медиана {v_med:.2f} В (диапазон {v_min:.2f}..{v_max:.2f} В). Генератор и АКБ в норме."
+
+  - id: sensor_grounds_adc
+    title: "Массы датчиков и АЦП"
+    type: event_window
+    mode: running
+    norm: "Стабильные ДТОЖ, ДПДЗ и АЦП ДМРВ при просадке U"
+    focus_traces: ["VBAT", "ECT", "TPS", "ADC_MAF"]
+    focus_metric: "u_drop"
+    trigger:
+      where: "(VBAT_start - VBAT_end) >= 0.45"
+      cooldown_sec: 1.0
+    window:
+      duration_sec: 0.8
+      min_frames: 2
+      metrics:
+        u_drop: "VBAT_start - min(VBAT)"
+        ect_jump: "max(abs(ECT - ECT_start))"
+        tps_span: "max(TPS) - min(TPS)"
+        maf_adc_jump: "max(ADC_MAF) - ADC_MAF_start"
+        is_ect_glitch: "ect_jump >= 3.0"
+        is_tps_glitch: "TPS_start <= 0.5 and max(TPS) >= 1.5"
+        is_maf_glitch: "tps_span <= 0.5 and (max(RPM) - RPM_start) <= 80 and maf_adc_jump >= 0.045"
+        is_glitch: "is_ect_glitch or is_tps_glitch or is_maf_glitch"
+    if_empty:
+      val: "Скачков U не было"
+      status: status-ok
+      badge: "НОРМА"
+      tip: "Резких просадок бортового напряжения при работе ДВС не зафиксировано."
+    rules:
+      - when: "count(is_glitch) >= 2"
+        status: bad
+        badge: "ПЛОХАЯ МАССА"
+        tags: ["bad_ground"]
+        val: "Сбоев масс: {count(is_glitch)} ({times(is_glitch)})"
+        tip: "Синхронные скачки датчиков (ДТОЖ/ДПДЗ/АЦП ДМРВ) при просадке напряжения до -{max(u_drop):.2f} В — проверьте обжимку масс жгута ЭБУ и массу ДМРВ."
+
+      - when: "count(is_glitch) == 1"
+        status: warn
+        badge: "ПЛОХАЯ МАССА?"
+        tags: ["bad_ground"]
+        val: "Единичный скачок ({times(is_glitch)})"
+        tip: "Обнаружен синхронный скачок АЦП датчика при просадке напряжения на {max(u_drop):.2f} В — проверьте массы ЭБУ и клеммы АКБ."
+
+      - default:
+        status: ok
+        badge: "НОРМА"
+        val: "АЦП датчиков стабильно"
+        tip: "При просадках напряжения (проанализировано {total_events} эпизодов) ложных скачков ДТОЖ, ДПДЗ и АЦП ДМРВ не выявлено."
